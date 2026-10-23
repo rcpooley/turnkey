@@ -1,0 +1,37 @@
+# Publishes to npm when a version tag (v1.2.3) is pushed, after the full test suite passes.
+# Uses npm trusted publishing (OIDC): no npm token is stored anywhere. The package's settings on
+# npmjs.com name this repository and this workflow file as its trusted publisher.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Trusted publishing needs npm 11.5.1 or newer
+        run: npm install -g npm@latest
+      - name: Tag matches package.json
+        run: |
+          v="$(node -p 'require("./package.json").version')"
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but package.json has $v"; exit 1; }
+      - run: npm ci
+      - run: npm run build
+      - run: npm publish --access public --ignore-scripts
