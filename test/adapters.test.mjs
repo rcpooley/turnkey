@@ -1,5 +1,5 @@
-// The web adapters, the Quiver commands and the admin CLI. Each adapter serves the credential
-// contract exactly as an orchestrator calls it; these run on SQLite (adapters don't touch SQL).
+// The web adapters, the Quiver commands and the admin CLI. Each adapter serves the token API
+// (docs/api.md) exactly as a client calls it; these run on SQLite (adapters don't touch SQL).
 import { describe, test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -35,7 +35,7 @@ const ADAPTERS = {
   express: (tk) => {
     const app = express()
     app.use(express.json())
-    app.use('/credentials', ex.credentialsRouter(tk, { service: 'demo' }))
+    app.use('/turnkey', ex.turnkeyRouter(tk))
     app.get('/elsewhere', (_req, res) => res.json({ ok: true }))
     // A real app's own JSON 404 and error handler (express.json() rejects bad JSON before Turnkey sees it).
     app.use((_req, res) => res.status(404).json({ error: 'app 404' }))
@@ -44,19 +44,19 @@ const ADAPTERS = {
   },
   'express (no body parser)': (tk) => {
     const app = express()
-    app.use('/credentials', ex.credentialsRouter(tk, { service: 'demo' }))
+    app.use('/turnkey', ex.turnkeyRouter(tk))
     app.use((_req, res) => res.status(404).json({ error: 'app 404' }))
     return app
   },
   node: (tk) => {
-    const handle = nd.credentialsHandler(tk, { service: 'demo' })
+    const handle = nd.turnkeyHandler(tk)
     return async (req, res) => {
       if (await handle(req, res)) return
       nd.sendJson(res, 404, { error: 'app 404' })
     }
   },
   fetch: (tk) => {
-    const handle = ft.credentialsHandler(tk, { service: 'demo' })
+    const handle = ft.turnkeyHandler(tk)
     // Bridge node → Request/Response, the way a fetch-style server would call it.
     return async (req, res) => {
       const chunks = []
@@ -74,98 +74,112 @@ const ADAPTERS = {
 }
 
 for (const [name, make] of Object.entries(ADAPTERS)) {
-  describe(`credential contract over ${name}`, () => {
-    let t, srv, issuer, plain
+  describe(`token API over ${name}`, () => {
+    let t, srv, admin, issuer, plain
     before(async () => {
-      t = await fresh(sqlite, { credentials: { maxTtlSeconds: 1800 } })
+      t = await fresh(sqlite, { children: { maxTtlSeconds: 1800 } })
       srv = await serve(make(t.tk))
-      issuer = (await t.tk.tokens.create({ label: 'lp', grants: ['turnkey:issue', 'write:sessions', 'read:*'], createdBy: 'x' })).secret
-      plain = (await t.tk.tokens.create({ label: 'plain', grants: ['write:*'], createdBy: 'x' })).secret
+      admin = (await t.tk.tokens.create({ label: 'admin', grants: ['turnkey:manage', 'write:*'] }, 'x')).secret
+      issuer = (await t.tk.tokens.create({ label: 'lp', grants: ['turnkey:issue', 'write:sessions', 'read:*'] }, 'x')).secret
+      plain = (await t.tk.tokens.create({ label: 'plain', grants: ['write:*'] }, 'x')).secret
     })
     after(async () => {
       await srv.close()
       await t.close()
     })
+    const api = (method, path, opts) => call(srv.base, method, '/turnkey' + path, opts)
 
-    test('every call needs an issuer token', async () => {
-      assert.equal((await call(srv.base, 'GET', '/credentials/describe')).status, 401)
-      const bad = await call(srv.base, 'GET', '/credentials/describe', { token: 'tt_nope' })
+    test('every call needs a token', async () => {
+      assert.equal((await api('GET', '/self')).status, 401)
+      const bad = await api('GET', '/tokens', { token: 'tt_nope' })
       assert.equal(bad.status, 401)
       assert.equal(bad.body.code, 'unauthorized')
-      const notIssuer = await call(srv.base, 'GET', '/credentials/describe', { token: plain })
-      assert.equal(notIssuer.status, 403)
-      assert.equal(typeof notIssuer.body.error, 'string')
     })
 
-    test('describe', async () => {
-      const r = await call(srv.base, 'GET', '/credentials/describe', { token: issuer })
+    test('self: who the caller is, what it holds, and the child cap', async () => {
+      const r = await api('GET', '/self', { token: issuer })
       assert.equal(r.status, 200)
-      assert.equal(r.body.service, 'demo')
-      assert.equal(r.body.maxTtlSeconds, 1800)
-      assert.deepEqual(Object.keys(r.body.values), ['token'])
-      assert.deepEqual(r.body.grants, ['read:*', 'write:sessions'])
+      assert.equal(r.body.label, 'lp')
+      assert.deepEqual(r.body.grants, ['read:*', 'turnkey:issue', 'write:sessions'])
+      assert.equal(r.body.maxChildTtlSeconds, 1800)
+      assert.equal((await api('GET', '/self', { token: plain })).body.label, 'plain', 'any token may see itself')
     })
 
-    test('validate: 2xx, 400 for a bad shape, 403 beyond the issuer', async () => {
-      const ok = await call(srv.base, 'POST', '/credentials/validate', { token: issuer, body: { permissions: { grants: ['write:sessions/abc', 'read:x'] } } })
-      assert.equal(ok.status, 200)
-      assert.deepEqual(ok.body.grants, ['read:x', 'write:sessions/abc'])
-      for (const permissions of [undefined, [], { grants: 'read:*' }, { grants: [] }, { grants: ['read:*'], extra: 1 }, { grants: ['bogus:x'] }, { grants: [5] }]) {
-        assert.equal((await call(srv.base, 'POST', '/credentials/validate', { token: issuer, body: { permissions } })).status, 400, JSON.stringify(permissions))
+    test('a child: dry run, create, use, extend, revoke, and 404 after', async () => {
+      const dry = await api('POST', '/tokens', { token: issuer, body: { child: true, name: 'sess-1', grants: ['write:sessions/sess-1'], dryRun: true } })
+      assert.equal(dry.status, 200)
+      assert.deepEqual(dry.body, { dryRun: true, label: 'lp.sess-1', grants: ['write:sessions/sess-1'], parent: dry.body.parent, expiresAt: new Date(t.clock.ms + 1800_000).toISOString() })
+      for (const body of [{ child: true }, { child: true, grants: 'read:*' }, { child: true, grants: [] }, { child: true, grants: ['bogus:x'] }, { child: true, grants: [5] }, { child: true, grants: ['read:*'], extra: 1 }, { child: 'yes', grants: ['read:*'] }]) {
+        assert.equal((await api('POST', '/tokens', { token: issuer, body: { ...body, dryRun: true } })).status, 400, JSON.stringify(body))
       }
-      assert.equal((await call(srv.base, 'POST', '/credentials/validate', { token: issuer, body: { permissions: { grants: ['write:projects'] } } })).status, 403)
-      assert.equal((await call(srv.base, 'POST', '/credentials/validate', { token: issuer, body: { permissions: { grants: ['turnkey:issue'] } } })).status, 403)
-      assert.equal((await call(srv.base, 'POST', '/credentials/validate', { token: issuer, body: '{not json' })).status, 400)
-    })
+      assert.equal((await api('POST', '/tokens', { token: issuer, body: { child: true, grants: ['write:projects'], dryRun: true } })).status, 403)
+      assert.equal((await api('POST', '/tokens', { token: issuer, body: { child: true, grants: ['turnkey:issue'], dryRun: true } })).status, 403)
+      assert.equal((await api('POST', '/tokens', { token: plain, body: { child: true, grants: ['read:x'], dryRun: true } })).status, 403)
+      assert.equal((await api('POST', '/tokens', { token: issuer, body: '{not json' })).status, 400)
 
-    test('issue → use → renew → revoke, and 404 after', async () => {
-      const issued = await call(srv.base, 'POST', '/credentials/issue', {
+      const made = await api('POST', '/tokens', {
         token: issuer,
-        body: { subject: { session: 'sess-1', agent: 'dev', host: 'h' }, permissions: { grants: ['write:sessions/sess-1'] }, ttlSeconds: 99999 },
+        body: { child: true, name: 'sess-1', grants: ['write:sessions/sess-1'], ttlSeconds: 99999, subject: { session: 'sess-1', agent: 'dev', host: 'h' } },
       })
-      assert.equal(issued.status, 200)
-      assert.deepEqual(Object.keys(issued.body).sort(), ['expiresAt', 'id', 'values'])
-      assert.deepEqual(Object.keys(issued.body.values), ['token'])
-      assert.ok(Date.parse(issued.body.expiresAt) - t.clock.ms <= 1800_000, 'capped at maxTtlSeconds')
-      const { id } = issued.body
-      const p = await t.tk.authenticate(issued.body.values.token)
-      assert.equal(p.label, 'lp.sess-1')
+      assert.equal(made.status, 201)
+      assert.deepEqual(Object.keys(made.body).sort(), ['secret', 'token'])
+      assert.equal(made.body.token.label, 'lp.sess-1')
+      assert.ok(Date.parse(made.body.token.expiresAt) - t.clock.ms <= 1800_000, 'capped')
+      const { id } = made.body.token
+      const p = await t.tk.authenticate(made.body.secret)
       assert.ok(t.tk.can(p, 'write', 'sessions/sess-1'))
+      assert.deepEqual((await api('GET', '/tokens', { token: issuer })).body.tokens.map((x) => x.label).sort(), ['lp', 'lp.sess-1'])
+      assert.equal((await api('GET', `/tokens?parent=lp`, { token: admin })).body.tokens.length, 1)
 
       t.clock.advance(600)
-      const renewed = await call(srv.base, 'POST', '/credentials/renew', { token: issuer, body: { id, ttlSeconds: 1800 } })
-      assert.equal(renewed.status, 200)
-      assert.equal(renewed.body.expiresAt, new Date(t.clock.ms + 1800_000).toISOString())
+      const extended = await api('POST', `/tokens/${id}/extend`, { token: issuer, body: { ttlSeconds: 1800 } })
+      assert.equal(extended.status, 200)
+      assert.equal(extended.body.expiresAt, new Date(t.clock.ms + 1800_000).toISOString())
+      assert.equal((await api('POST', `/tokens/${id}/extend`, { token: plain, body: { ttlSeconds: 60 } })).status, 404, 'plain cannot see it')
+      assert.equal((await api('POST', `/tokens/${id}/extend`, { token: issuer, body: { ttl: 60 } })).status, 400, 'unknown field')
 
-      assert.equal((await call(srv.base, 'POST', '/credentials/revoke', { token: issuer, body: { id } })).status, 200)
-      assert.equal((await call(srv.base, 'POST', '/credentials/revoke', { token: issuer, body: { id } })).status, 200, 'idempotent')
-      const gone = await call(srv.base, 'POST', '/credentials/renew', { token: issuer, body: { id, ttlSeconds: 1800 } })
+      const revoked = await api('POST', `/tokens/${id}/revoke`, { token: issuer })
+      assert.equal(revoked.status, 200)
+      assert.equal(revoked.body.active, false)
+      assert.equal((await api('POST', `/tokens/${id}/revoke`, { token: issuer })).status, 200, 'idempotent')
+      const gone = await api('POST', `/tokens/${id}/extend`, { token: issuer, body: { ttlSeconds: 1800 } })
       assert.equal(gone.status, 404)
       assert.equal(gone.body.code, 'not_found')
-      assert.equal(await t.tk.authenticate(issued.body.values.token), null)
+      assert.equal(await t.tk.authenticate(made.body.secret), null)
+      assert.equal((await api('GET', '/tokens?all=true', { token: issuer })).body.tokens.length, 2)
     })
 
-    test('issue needs subject.session; renew of an expired credential is a 404', async () => {
-      assert.equal((await call(srv.base, 'POST', '/credentials/issue', { token: issuer, body: { permissions: { grants: ['read:x'] } } })).status, 400)
-      assert.equal((await call(srv.base, 'POST', '/credentials/issue', { token: issuer, body: { subject: {}, permissions: { grants: ['read:x'] } } })).status, 400)
-      const r = await call(srv.base, 'POST', '/credentials/issue', { token: issuer, body: { subject: { session: 's' }, permissions: { grants: ['read:x'] }, ttlSeconds: 60 } })
-      t.clock.advance(61)
-      const gone = await call(srv.base, 'POST', '/credentials/renew', { token: issuer, body: { id: r.body.id, ttlSeconds: 60 } })
-      assert.equal(gone.status, 404)
-      assert.equal(gone.body.code, 'not_found')
-    })
-
-    test('an issued credential cannot use the contract', async () => {
-      const r = await call(srv.base, 'POST', '/credentials/issue', { token: issuer, body: { subject: { session: 'x' }, permissions: { grants: ['read:*'] } } })
-      const res = await call(srv.base, 'POST', '/credentials/issue', { token: r.body.values.token, body: { subject: { session: 'y' }, permissions: { grants: ['read:*'] } } })
+    test('a child cannot create, and expires on its own', async () => {
+      const r = await api('POST', '/tokens', { token: issuer, body: { child: true, name: 'x', grants: ['read:*'], ttlSeconds: 60 } })
+      const res = await api('POST', '/tokens', { token: r.body.secret, body: { child: true, name: 'y', grants: ['read:*'] } })
       assert.equal(res.status, 403)
+      t.clock.advance(61)
+      assert.equal((await api('POST', `/tokens/${r.body.token.id}/extend`, { token: issuer, body: {} })).status, 404)
     })
 
-    test('other paths fall through to the app', async () => {
-      const r = await call(srv.base, 'GET', '/credentials/nope', { token: issuer })
-      assert.equal(r.status, 404)
-      const wrongMethod = await call(srv.base, 'GET', '/credentials/issue', { token: issuer })
-      assert.equal(wrongMethod.status, 405)
+    test('managing: create, show, grant, ungrant, rotate, revoke, with the rules', async () => {
+      const made = await api('POST', '/tokens', { token: admin, body: { label: 'host-1', grants: ['read:things'] } })
+      assert.equal(made.status, 201)
+      assert.equal(made.body.token.createdBy, 'admin')
+      assert.equal((await api('POST', '/tokens', { token: admin, body: { label: 'root', grants: ['*:*'] } })).status, 403, 'only what it holds')
+      assert.equal((await api('POST', '/tokens', { token: issuer, body: { label: 'host-2', grants: ['read:*'] } })).status, 403)
+      assert.equal((await api('GET', '/tokens/host-1', { token: admin })).body.label, 'host-1')
+      assert.equal((await api('GET', '/tokens/host-1', { token: plain })).status, 404)
+      assert.deepEqual((await api('POST', '/tokens/host-1/grant', { token: admin, body: { grants: ['write:b'] } })).body.grants, ['read:things', 'write:b'])
+      assert.deepEqual((await api('POST', '/tokens/host-1/ungrant', { token: admin, body: { grants: ['read:things'] } })).body.grants, ['write:b'])
+      const rotated = await api('POST', '/tokens/host-1/rotate', { token: admin })
+      assert.notEqual(rotated.body.secret, made.body.secret)
+      assert.equal((await api('POST', '/tokens/host-1/revoke', { token: rotated.body.secret })).body.revokedBy, 'host-1', 'a token may revoke itself')
+    })
+
+    test('other paths fall through to the app; a wrong method is a 405', async () => {
+      assert.equal((await api('GET', '/nope', { token: issuer })).body?.error, 'app 404')
+      assert.equal((await api('GET', '/tokens/x/y/z', { token: issuer })).body?.error, 'app 404')
+      assert.equal((await api('DELETE', '/tokens', { token: issuer })).status, 405)
+      assert.equal((await api('GET', '/tokens/lp/extend', { token: issuer })).status, 405)
+      assert.equal((await call(srv.base, 'GET', '/turnkey//evil.example/self', { token: issuer })).body?.error, 'app 404', 'a // path is not a host')
+      assert.equal((await api('POST', '/tokens', { token: issuer, body: { child: true, grants: ['read:*'], ttlSeconds: '60' } })).status, 400)
+      assert.equal((await api('POST', '/tokens/lp/extend', { token: admin, body: { ttlSeconds: [5] } })).status, 400)
     })
   })
 }
@@ -179,7 +193,7 @@ describe('browser sessions over the adapters', () => {
   after(async () => t.close())
 
   const login = async () => {
-    const { secret, token } = await t.tk.sessions.create({ grants: ['read:*'], createdBy: 'login' })
+    const { secret, token } = await t.tk.sessions.create({ grants: ['read:*'] }, 'login')
     return { secret, token, header: `app_session=${encodeURIComponent(secret)}` }
   }
 
@@ -204,7 +218,7 @@ describe('browser sessions over the adapters', () => {
       const me = await call(srv.base, 'GET', '/me', { headers: { cookie: s.header } })
       assert.deepEqual(me.body, { label: s.token.label, via: 'cookie' })
       assert.equal(me.headers.get('set-cookie'), null)
-      const tok = await t.tk.tokens.create({ label: 'cli', grants: ['read:*'], createdBy: 'x' })
+      const tok = await t.tk.tokens.create({ label: 'cli', grants: ['read:*'] }, 'x')
       assert.equal((await call(srv.base, 'GET', '/me', { token: tok.secret, headers: { cookie: s.header } })).body.via, 'bearer', 'the header wins')
 
       t.clock.advance(4 * 3600)
@@ -219,7 +233,7 @@ describe('browser sessions over the adapters', () => {
       assert.equal((await call(srv.base, 'POST', '/things', { token: tok.secret, headers: { origin: 'https://evil.example' } })).status, 200, 'Bearer is not a cookie')
       assert.equal((await call(srv.base, 'POST', '/admin', { headers: { cookie: s.header } })).status, 403)
 
-      await t.tk.sessions.revoke(s.token.id, 'logout')
+      await t.tk.tokens.revoke(s.token.id, 'logout')
       const out = await call(srv.base, 'GET', '/me', { headers: { cookie: s.header } })
       assert.equal(out.status, 401)
       assert.match(out.body.error, /log in again/)
@@ -273,30 +287,33 @@ describe('browser sessions over the adapters', () => {
 })
 
 describe('Quiver token commands', () => {
-  let t, cmds, admin, reader
+  let t, cmds, admin, issuer, reader
   before(async () => {
     t = await fresh(sqlite)
     cmds = tokenCommands(t.tk)
-    admin = await t.tk.authenticate((await t.tk.tokens.create({ label: 'admin', grants: ['turnkey:manage', 'turnkey:issue', 'read:*'], createdBy: 'x' })).secret)
-    reader = await t.tk.authenticate((await t.tk.tokens.create({ label: 'reader', grants: ['read:*'], createdBy: 'x' })).secret)
+    admin = await t.tk.authenticate((await t.tk.tokens.create({ label: 'admin', grants: ['turnkey:manage', 'read:*', 'write:*'] }, 'x')).secret)
+    issuer = await t.tk.authenticate((await t.tk.tokens.create({ label: 'lp', grants: ['turnkey:issue', 'read:*'] }, 'x')).secret)
+    reader = await t.tk.authenticate((await t.tk.tokens.create({ label: 'reader', grants: ['read:*'] }, 'x')).secret)
   })
   after(async () => t.close())
 
   test('the manifest group', () => {
     assert.equal(cmds.commands.length, 1)
     assert.equal(cmds.commands[0].name, 'tokens')
-    assert.deepEqual(cmds.commands[0].commands.map((c) => c.name), ['list', 'show', 'create', 'grant', 'ungrant', 'revoke', 'rotate', 'credentials'])
+    assert.deepEqual(cmds.commands[0].commands.map((c) => c.name), ['list', 'show', 'create', 'extend', 'grant', 'ungrant', 'revoke', 'rotate'])
     assert.ok(cmds.handles(['tokens', 'list']))
     assert.ok(!cmds.handles(['tokens']))
     assert.ok(!cmds.handles(['other', 'list']))
   })
 
-  test('every command needs turnkey:manage', async () => {
-    await assert.rejects(() => cmds.run(['tokens', 'list'], {}, reader), (e) => e.status === 403)
+  test('the same rules as the library', async () => {
     await assert.rejects(() => cmds.run(['tokens', 'list'], {}, null), (e) => e.status === 401)
+    assert.deepEqual((await cmds.run(['tokens', 'list'], {}, reader)).tokens.map((x) => x.label), ['reader'], 'any token sees itself')
+    await assert.rejects(() => cmds.run(['tokens', 'create'], { label: 'x', grant: ['read:a'] }, reader), (e) => e.status === 403)
+    await assert.rejects(() => cmds.run(['tokens', 'show'], { label: 'admin' }, reader), (e) => e.status === 404)
   })
 
-  test('create, list, grant, ungrant, rotate, revoke, credentials', async () => {
+  test('create, list, extend, grant, ungrant, rotate, revoke', async () => {
     const created = await cmds.run(['tokens', 'create'], { label: 'host1', grant: ['read:a'], session: 'abc' }, admin)
     assert.match(created.secret, /^tt_/)
     assert.equal(created.createdBy, 'session:abc@admin')
@@ -306,12 +323,20 @@ describe('Quiver token commands', () => {
     const rotated = await cmds.run(['tokens', 'rotate'], { label: 'host1' }, admin)
     assert.notEqual(rotated.secret, created.secret)
     assert.equal((await cmds.run(['tokens', 'show'], { label: 'host1' }, admin)).label, 'host1')
-    await t.tk.credentials.issue(admin, { grants: ['read:x'], subject: { session: 'q' } })
-    assert.equal((await cmds.run(['tokens', 'credentials'], {}, admin)).credentials.length, 1)
+    assert.equal((await cmds.run(['tokens', 'extend'], { label: 'host1', ttl: 600 }, admin)).expiresAt, new Date(t.clock.ms + 600_000).toISOString())
     assert.equal((await cmds.run(['tokens', 'revoke'], { label: 'host1' }, admin)).active, false)
     assert.ok(!(await cmds.run(['tokens', 'list'], {}, admin)).tokens.some((x) => x.label === 'host1'))
     assert.ok((await cmds.run(['tokens', 'list'], { all: true }, admin)).tokens.some((x) => x.label === 'host1'))
     await assert.rejects(() => cmds.run(['tokens', 'create'], { label: 'x', grant: [] }, admin), (e) => e.status === 400)
+  })
+
+  test('children through the commands', async () => {
+    const c = await cmds.run(['tokens', 'create'], { label: 'job-1', grant: ['read:x'], child: true, ttl: 120 }, issuer)
+    assert.equal(c.label, 'lp.job-1')
+    assert.equal(c.parent, issuer.id)
+    assert.deepEqual((await cmds.run(['tokens', 'list'], { parent: 'lp' }, admin)).tokens.map((x) => x.label), ['lp.job-1'])
+    assert.equal((await cmds.run(['tokens', 'extend'], { label: 'lp.job-1' }, issuer)).expiresAt, new Date(t.clock.ms + 3600_000).toISOString())
+    assert.equal((await cmds.run(['tokens', 'revoke'], { label: 'lp.job-1' }, issuer)).active, false)
   })
 })
 
@@ -331,6 +356,8 @@ describe('admin CLI', () => {
       assert.equal((await t.tk.authenticate(created.secret)).label, 'first')
       assert.equal(await run('list'), 0)
       assert.equal(JSON.parse(out.pop()).length, 1)
+      assert.equal(await run('extend', 'first', '--expires', new Date(t.clock.ms + 86_400_000).toISOString()), 0)
+      assert.equal(JSON.parse(out.pop()).expiresAt, new Date(t.clock.ms + 86_400_000).toISOString())
       assert.equal(await run('grant', 'first', '--grant', 'write:x'), 0)
       assert.deepEqual(JSON.parse(out.pop()).grants, ['read:*', 'turnkey:manage', 'write:x'])
       assert.equal(await run('rotate', 'first'), 0)

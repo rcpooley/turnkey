@@ -62,7 +62,7 @@ async function isDolt(q: Queryable): Promise<boolean> {
 }
 
 /**
- * Dolt commits every change, and renewing credentials would flood the service's history. So
+ * Dolt commits every change, and extending child tokens would flood the service's history. So
  * Turnkey's tables are listed in `dolt_ignore` before any of them exists, and only that change is
  * committed. Ignored tables live in the working set and never enter a commit.
  */

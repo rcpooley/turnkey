@@ -1,10 +1,10 @@
 // Adapter for the standard Request/Response: Hono, Bun, Deno, workers, anything modern.
-import { authenticateRequest, credentialRoutes, errorResponse, type AuthOptions, type CredentialRoutesOptions } from '../http.js'
+import { authenticateRequest, errorResponse, turnkeyRoutes, type AuthOptions, type RoutesOptions } from '../http.js'
 import { badRequest } from '../errors.js'
 import type { Principal, Turnkey } from '../turnkey.js'
 
 export { sessionCookie, clearSessionCookie, readCookie } from '../http.js'
-export type { AuthOptions, CookieOptions, CredentialRoutesOptions } from '../http.js'
+export type { AuthOptions, CookieOptions, RoutesOptions } from '../http.js'
 
 export interface FetchAuth {
   principal: Principal | null
@@ -25,17 +25,18 @@ export async function authenticate(tk: Turnkey, request: Request, opts: AuthOpti
   return { principal: r.principal, headers }
 }
 
-export interface CredentialsHandlerOptions extends CredentialRoutesOptions {
-  /** Where the routes live. Default `/credentials`. */
+export interface HandlerOptions extends RoutesOptions {
+  /** Where the API lives. Default `/turnkey`. */
   prefix?: string
 }
 
-/** The credential contract's routes. Returns null for a request it doesn't serve. */
-export function credentialsHandler(tk: Turnkey, opts: CredentialsHandlerOptions) {
-  const prefix = (opts.prefix ?? '/credentials').replace(/\/+$/, '')
-  const handle = credentialRoutes(tk, opts)
+/** Turnkey's token API (docs/api.md) under `prefix`. Returns null for a request it doesn't serve. */
+export function turnkeyHandler(tk: Turnkey, opts: HandlerOptions = {}) {
+  const prefix = (opts.prefix ?? '/turnkey').replace(/\/+$/, '')
+  const handle = turnkeyRoutes(tk, opts)
   return async (request: Request): Promise<Response | null> => {
-    const path = new URL(request.url).pathname
+    const u = new URL(request.url)
+    const path = u.pathname
     if (path !== prefix && !path.startsWith(prefix + '/')) return null
     let out
     try {
@@ -49,7 +50,7 @@ export function credentialsHandler(tk: Turnkey, opts: CredentialsHandlerOptions)
           throw badRequest('the body is not valid JSON')
         }
       }
-      out = await handle({ method: request.method, path: path.slice(prefix.length), authorization: request.headers.get('authorization'), body })
+      out = await handle({ method: request.method, url: path.slice(prefix.length) + u.search, authorization: request.headers.get('authorization'), body })
     } catch (err) {
       out = errorResponse(err)
     }

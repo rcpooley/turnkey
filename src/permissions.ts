@@ -90,8 +90,9 @@ export function parsePermission(text: string, actions: Actions): Permission {
 
 export const formatPermission = (p: Permission) => `${p.action}:${p.resource.join('/')}`
 
-/** Whether `a` allows everything `b` allows. */
+/** Whether `a` allows everything `b` allows. `turnkey:manage` includes `turnkey:issue`. */
 export function covers(a: Permission, b: Permission, actions: Actions): boolean {
+  if ((a.action === TURNKEY || a.action === '*') && b.action === TURNKEY && a.resource.length === 1 && a.resource[0] === 'manage' && b.resource[0] === 'issue') return true
   if (!actions.allows(a.action, b.action)) return false
   if (a.resource.length === 1 && a.resource[0] === '*') return true
   if (a.resource.length > b.resource.length) return false

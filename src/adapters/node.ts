@@ -1,10 +1,10 @@
 // node:http adapter: helpers for a plain `(req, res)` server.
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { authenticateRequest, credentialRoutes, errorResponse, readJson, type AuthOptions, type CredentialRoutesOptions, type JsonResponse } from '../http.js'
+import { authenticateRequest, errorResponse, readJson, turnkeyRoutes, type AuthOptions, type JsonResponse, type RoutesOptions } from '../http.js'
 import type { Principal, Turnkey } from '../turnkey.js'
 
 export { sessionCookie, clearSessionCookie, readCookie } from '../http.js'
-export type { AuthOptions, CookieOptions, CredentialRoutesOptions } from '../http.js'
+export type { AuthOptions, CookieOptions, RoutesOptions } from '../http.js'
 
 const header = (req: IncomingMessage, name: string): string | undefined => {
   const v = req.headers[name]
@@ -31,25 +31,26 @@ export async function principal(tk: Turnkey, req: IncomingMessage, res?: ServerR
   return r.principal
 }
 
-export interface CredentialsHandlerOptions extends CredentialRoutesOptions {
-  /** Where the routes live. Default `/credentials`. */
+export interface HandlerOptions extends RoutesOptions {
+  /** Where the API lives. Default `/turnkey`. */
   prefix?: string
 }
 
 /**
- * The credential contract's routes. Returns true if it answered the request, false if the path
- * isn't one of its routes (so your server carries on routing).
+ * Turnkey's token API (docs/api.md) under `prefix`. Returns true if it answered the request, false
+ * if the path isn't one of its routes (so your server carries on routing).
  */
-export function credentialsHandler(tk: Turnkey, opts: CredentialsHandlerOptions) {
-  const prefix = (opts.prefix ?? '/credentials').replace(/\/+$/, '')
-  const handle = credentialRoutes(tk, opts)
+export function turnkeyHandler(tk: Turnkey, opts: HandlerOptions = {}) {
+  const prefix = (opts.prefix ?? '/turnkey').replace(/\/+$/, '')
+  const handle = turnkeyRoutes(tk, opts)
   return async (req: IncomingMessage, res: ServerResponse): Promise<boolean> => {
-    const path = new URL(req.url ?? '/', 'http://x').pathname
+    const u = new URL(req.url ?? '/', 'http://x')
+    const path = u.pathname
     if (path !== prefix && !path.startsWith(prefix + '/')) return false
     let out: JsonResponse | null
     try {
       const body = req.method === 'POST' ? await readJson(req) : undefined
-      out = await handle({ method: req.method ?? 'GET', path: path.slice(prefix.length), authorization: header(req, 'authorization'), body })
+      out = await handle({ method: req.method ?? 'GET', url: path.slice(prefix.length) + u.search, authorization: header(req, 'authorization'), body })
     } catch (err) {
       out = errorResponse(err)
     }

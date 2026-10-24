@@ -1,7 +1,7 @@
 // Break-glass token commands for a service's own admin entry point: the first token, or a new one
 // after you revoked your own. Runs with direct database access, so it checks no permission.
 //   token list [--all] | show <label> | create <label> --grant <p>... [--expires <iso>]
-//   token grant|ungrant <label> --grant <p>... | revoke <label> | rotate <label>
+//   token extend <label> --expires <iso> | grant|ungrant <label> --grant <p>... | revoke <label> | rotate <label>
 import { TurnkeyError } from './errors.js'
 import type { TokenInfo, Turnkey } from './turnkey.js'
 
@@ -11,9 +11,10 @@ export interface AdminIo {
 }
 
 const USAGE = `usage: token <command>
-  list [--all]                                   tokens, sessions and credentials
+  list [--all]                                   every token, session and child
   show <label>
   create <label> --grant <perm>... [--expires <iso>]   prints the secret once
+  extend <label> --expires <iso>
   grant <label> --grant <perm>...
   ungrant <label> --grant <perm>...
   revoke <label>
@@ -40,21 +41,24 @@ export async function runAdminCli(tk: Turnkey, argv: readonly string[], io: Admi
   try {
     switch (cmd) {
       case 'list':
-        io.out(JSON.stringify(await tk.tokens.list({ all: !!flags.all }), null, 2))
+        io.out(JSON.stringify(await tk.tokens.list(by, { all: !!flags.all }), null, 2))
         return 0
       case 'show':
-        show(await tk.tokens.get(need(pos[0], 'label')))
+        show(await tk.tokens.get(need(pos[0], 'label'), by))
         return 0
       case 'create': {
-        const r = await tk.tokens.create({ label: need(pos[0], 'label'), grants: flags.grant ?? [], expiresAt: flags.expires?.[0] ?? null, createdBy: by })
+        const r = await tk.tokens.create({ label: need(pos[0], 'label'), grants: flags.grant ?? [], expiresAt: flags.expires?.[0] ?? null }, by)
         show(r.token, r.secret)
         return 0
       }
+      case 'extend':
+        show(await tk.tokens.extend(need(pos[0], 'label'), { expiresAt: need(flags.expires?.[0], 'expires') }, by))
+        return 0
       case 'grant':
-        show(await tk.tokens.grant(need(pos[0], 'label'), flags.grant ?? []))
+        show(await tk.tokens.grant(need(pos[0], 'label'), flags.grant ?? [], by))
         return 0
       case 'ungrant':
-        show(await tk.tokens.ungrant(need(pos[0], 'label'), flags.grant ?? []))
+        show(await tk.tokens.ungrant(need(pos[0], 'label'), flags.grant ?? [], by))
         return 0
       case 'revoke':
         show(await tk.tokens.revoke(need(pos[0], 'label'), by))

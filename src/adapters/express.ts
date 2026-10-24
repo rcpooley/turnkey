@@ -1,13 +1,15 @@
 // Express (4 and 5) adapter. Structural types only: this file never imports express.
-import { authenticateRequest, credentialRoutes, errorResponse, readJson, type AuthOptions, type CredentialRoutesOptions } from '../http.js'
+import { authenticateRequest, errorResponse, readJson, turnkeyRoutes, type AuthOptions, type RoutesOptions } from '../http.js'
 import type { Principal, Turnkey } from '../turnkey.js'
 
 export { sessionCookie, clearSessionCookie, readCookie } from '../http.js'
-export type { AuthOptions, CookieOptions, CredentialRoutesOptions } from '../http.js'
+export type { AuthOptions, CookieOptions, RoutesOptions } from '../http.js'
 
 interface Req extends AsyncIterable<unknown> {
   method: string
   path: string
+  /** Below the mount point, with the query string. */
+  url: string
   body?: unknown
   headers: Record<string, string | string[] | undefined>
   principal?: Principal | null
@@ -77,15 +79,15 @@ export function requirePermission(tk: Turnkey, action: string, resource: string 
 }
 
 /**
- * The credential contract's routes, to mount where you like: `app.use('/credentials', credentialsRouter(tk, {service: 'notes'}))`.
- * Parses JSON itself if no body parser ran.
+ * Turnkey's token API (docs/api.md), to mount where you like: `app.use('/turnkey', turnkeyRouter(tk))`.
+ * Parses JSON itself if no body parser ran. Other paths fall through to `next()`.
  */
-export function credentialsRouter(tk: Turnkey, opts: CredentialRoutesOptions) {
-  const handle = credentialRoutes(tk, opts)
+export function turnkeyRouter(tk: Turnkey, opts: RoutesOptions = {}) {
+  const handle = turnkeyRoutes(tk, opts)
   return (req: Req, res: Res, next: Next): void => {
     ;(async () => {
       const body = req.method === 'POST' ? (req.body !== undefined ? req.body : await readJson(req)) : undefined
-      return handle({ method: req.method, path: req.path, authorization: header(req, 'authorization'), body })
+      return handle({ method: req.method, url: req.url, authorization: header(req, 'authorization'), body })
     })().then(
       (out) => {
         if (!out) return next()

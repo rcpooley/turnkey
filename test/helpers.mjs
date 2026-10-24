@@ -129,8 +129,14 @@ export async function fresh(backend, opts = {}) {
   return { tk, env, clock: c, async close() { await tk.close(); await env.close() } }
 }
 
-/** A permanent token with these grants, authenticated. */
+/** An independent token with these grants, created by the service itself, and authenticated. */
 export async function principalWith(tk, label, grants) {
-  const { secret } = await tk.tokens.create({ label, grants, createdBy: 'test' })
-  return { secret, principal: await tk.authenticate(secret) }
+  const { secret, token } = await tk.tokens.create({ label, grants }, 'test')
+  return { secret, token, principal: await tk.authenticate(secret) }
+}
+
+/** A child of `parent` (a principal), authenticated. */
+export async function childOf(tk, parent, input = {}) {
+  const { secret, token } = await tk.tokens.create({ grants: ['read:*'], ...input, child: true }, parent)
+  return { secret, token, principal: await tk.authenticate(secret) }
 }

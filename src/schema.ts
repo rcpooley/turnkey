@@ -54,6 +54,24 @@ export const MIGRATIONS: Migration[] = [
     name: 'tokens',
     statements: forAll((d) => [tokensTable(d), 'CREATE INDEX {p}tokens_issued_by ON {p}tokens (issued_by)']),
   },
+  {
+    // 0.2.0: one token concept. An issued credential is now a child of the token that created it,
+    // and a token's kind is no longer stored (a child has a parent; a session has a sliding expiry).
+    version: 2,
+    name: 'parent',
+    // MySQL commits each DDL statement on its own, so there it is one ALTER (atomic): a crash can't
+    // leave it half done. Postgres and SQLite run the migration in a transaction.
+    statements: forAll((d) =>
+      d === 'mysql'
+        ? ['ALTER TABLE {p}tokens DROP INDEX {p}tokens_issued_by, RENAME COLUMN issued_by TO parent, ADD INDEX {p}tokens_parent (parent), DROP COLUMN kind']
+        : [
+            'DROP INDEX {p}tokens_issued_by',
+            'ALTER TABLE {p}tokens RENAME COLUMN issued_by TO parent',
+            'CREATE INDEX {p}tokens_parent ON {p}tokens (parent)',
+            'ALTER TABLE {p}tokens DROP COLUMN kind',
+          ],
+    ),
+  },
 ]
 
 /** The bookkeeping table. Created before anything else, outside the numbered migrations. */
@@ -62,7 +80,7 @@ export const MIGRATIONS_TABLE = migrationsTable
 /** The columns each table has after the latest migration. The startup check compares against this. */
 export const EXPECTED_COLUMNS: Record<string, string[]> = {
   tokens: [
-    'id', 'label', 'kind', 'secret_hash', 'grants', 'subject', 'issued_by', 'expires_at', 'slide_seconds',
+    'id', 'label', 'secret_hash', 'grants', 'subject', 'parent', 'expires_at', 'slide_seconds',
     'created_at', 'created_by', 'rotated_at', 'rotated_by', 'revoked_at', 'revoked_by', 'last_used_at',
   ],
   migrations: ['version', 'name', 'checksum', 'applied_at'],
