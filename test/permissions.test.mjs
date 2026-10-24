@@ -60,7 +60,9 @@ test('implies is transitive; * covers every action', () => {
   assert.ok(cov('*:x', 'exec:x/y'))
   assert.ok(cov('*:*', 'turnkey:manage'))
   assert.ok(cov('turnkey:*', 'turnkey:issue'))
-  assert.ok(!cov('turnkey:manage', 'turnkey:issue'))
+  assert.ok(cov('turnkey:manage', 'turnkey:issue'), 'manage includes issue')
+  assert.ok(!cov('turnkey:issue', 'turnkey:manage'))
+  assert.ok(cov('*:manage', 'turnkey:issue'), 'however manage is held')
   assert.ok(!cov('*:x', '*:*'))
 })
 

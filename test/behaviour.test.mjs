@@ -4,10 +4,11 @@ import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { createTurnkey } from '../dist/index.js'
-import { available, clock, fresh, PERMISSIONS, principalWith } from './helpers.mjs'
+import { available, childOf, clock, fresh, PERMISSIONS, principalWith } from './helpers.mjs'
 
 const sha = (s) => createHash('sha256').update(s).digest('hex')
-const rejects = (p, status, re) => assert.rejects(p, (e) => e.status === status && (!re || re.test(e.message)))
+// `re` is a pattern the message must match, or a note saying why.
+const rejects = (p, status, re) => assert.rejects(p, (e) => e.status === status && (!(re instanceof RegExp) || re.test(e.message)), typeof re === 'string' ? re : undefined)
 
 for (const backend of await available()) {
   describe(`behaviour on ${backend.name}`, () => {
@@ -16,17 +17,19 @@ for (const backend of await available()) {
     test('create, authenticate and the secret format', async () => {
       const t = await fresh(backend)
       try {
-        const { token, secret } = await t.tk.tokens.create({ label: 'dev', grants: ['write:things', 'read:*', 'read:*'], createdBy: 'alice' })
+        const { token, secret } = await t.tk.tokens.create({ label: 'dev', grants: ['write:things', 'read:*', 'read:*'] }, 'alice')
         assert.match(secret, /^tt_[A-Za-z0-9_-]{43}$/)
         assert.deepEqual(token.grants, ['read:*', 'write:things'])
-        assert.equal(token.kind, 'token')
+        assert.equal(token.parent, null)
         assert.equal(token.createdBy, 'alice')
         assert.equal(token.active, true)
+        assert.equal(token.expiresAt, null)
+        assert.ok(!('kind' in token), 'there is one kind of token')
         const p = await t.tk.authenticate(secret)
         assert.equal(p.label, 'dev')
         assert.equal(p.id, token.id)
         assert.deepEqual(p.grants, ['read:*', 'write:things'])
-        assert.equal(p.issuedBy, null)
+        assert.equal(p.parent, null)
         assert.equal((await t.tk.authenticate(`Bearer ${secret}`)).id, token.id)
         assert.equal((await t.tk.authenticate(`bearer   ${secret}  `)).id, token.id)
         // Only the hash is stored.
@@ -43,18 +46,20 @@ for (const backend of await available()) {
     test('labels are unique while live; a revoked or expired label is taken over', async () => {
       const t = await fresh(backend)
       try {
-        await t.tk.tokens.create({ label: 'ci', grants: ['read:*'], createdBy: 'x' })
-        await rejects(t.tk.tokens.create({ label: 'ci', grants: ['read:*'], createdBy: 'x' }), 409)
-        await rejects(t.tk.tokens.create({ label: 'Bad Label', grants: ['read:*'], createdBy: 'x' }), 400)
-        await rejects(t.tk.tokens.create({ label: 'ok', grants: [], createdBy: 'x' }), 400)
-        await rejects(t.tk.tokens.create({ label: 'ok', grants: ['nope:x'], createdBy: 'x' }), 400)
-        await rejects(t.tk.tokens.create({ label: 'ok', grants: ['read:*'], createdBy: '' }), 400)
+        await t.tk.tokens.create({ label: 'ci', grants: ['read:*'] }, 'x')
+        await rejects(t.tk.tokens.create({ label: 'ci', grants: ['read:*'] }, 'x'), 409)
+        await rejects(t.tk.tokens.create({ label: 'Bad Label', grants: ['read:*'] }, 'x'), 400)
+        await rejects(t.tk.tokens.create({ grants: ['read:*'] }, 'x'), 400, /bad label/)
+        await rejects(t.tk.tokens.create({ label: 'ok', grants: [] }, 'x'), 400)
+        await rejects(t.tk.tokens.create({ label: 'ok', grants: ['nope:x'] }, 'x'), 400)
+        await rejects(t.tk.tokens.create({ label: 'ok', grants: ['read:*'] }, ''), 400)
+        await rejects(t.tk.tokens.create({ label: 'ok', name: 'n', grants: ['read:*'] }, 'x'), 400, /name is for a child/)
         await t.tk.tokens.revoke('ci', 'x')
-        const again = await t.tk.tokens.create({ label: 'ci', grants: ['write:*'], createdBy: 'x' })
+        const again = await t.tk.tokens.create({ label: 'ci', grants: ['write:*'] }, 'x')
         assert.deepEqual(again.token.grants, ['write:*'])
-        await t.tk.tokens.create({ label: 'short', grants: ['read:*'], createdBy: 'x', expiresAt: new Date(t.clock.ms + 60_000) })
+        await t.tk.tokens.create({ label: 'short', grants: ['read:*'], expiresAt: new Date(t.clock.ms + 60_000) }, 'x')
         t.clock.advance(61)
-        await t.tk.tokens.create({ label: 'short', grants: ['read:*'], createdBy: 'x' })
+        await t.tk.tokens.create({ label: 'short', grants: ['read:*'] }, 'x')
       } finally {
         await t.close()
       }
@@ -76,23 +81,29 @@ for (const backend of await available()) {
         assert.throws(() => t.tk.require(p, 'write', 'projects/x'), (e) => e.status === 403 && /may not write projects\/x/.test(e.message))
         assert.throws(() => t.tk.require(null, 'read', 'x'), (e) => e.status === 401)
         t.tk.require(p, 'read', 'projects')
+        const { principal: m } = await principalWith(t.tk, 'm', ['turnkey:manage'])
+        assert.ok(t.tk.can(m, 'turnkey', 'issue'), 'manage includes issue')
       } finally {
         await t.close()
       }
     })
 
-    test('expiry is checked on every lookup', async () => {
+    test('expiry: expiresAt or ttlSeconds, checked on every lookup', async () => {
       const t = await fresh(backend)
       try {
-        const { secret } = await t.tk.tokens.create({ label: 'tmp', grants: ['read:*'], createdBy: 'x', expiresAt: new Date(t.clock.ms + 10_000).toISOString() })
+        const { secret } = await t.tk.tokens.create({ label: 'tmp', grants: ['read:*'], expiresAt: new Date(t.clock.ms + 10_000).toISOString() }, 'x')
+        const ttl = await t.tk.tokens.create({ label: 'ttl', grants: ['read:*'], ttlSeconds: 20 }, 'x')
+        assert.equal(ttl.token.expiresAt, new Date(t.clock.ms + 20_000).toISOString())
         assert.ok(await t.tk.authenticate(secret))
         t.clock.advance(10)
         assert.equal(await t.tk.authenticate(secret), null)
-        assert.equal((await t.tk.tokens.list()).length, 0)
-        assert.equal((await t.tk.tokens.list({ all: true })).length, 1)
-        assert.equal((await t.tk.tokens.get('tmp')).active, false)
-        await rejects(t.tk.tokens.create({ label: 'past', grants: ['read:*'], createdBy: 'x', expiresAt: new Date(t.clock.ms - 1000) }), 400)
-        await rejects(t.tk.tokens.create({ label: 'bad', grants: ['read:*'], createdBy: 'x', expiresAt: 'tomorrow' }), 400)
+        assert.equal((await t.tk.tokens.list('x')).length, 1)
+        assert.equal((await t.tk.tokens.list('x', { all: true })).length, 2)
+        assert.equal((await t.tk.tokens.get('tmp', 'x')).active, false)
+        await rejects(t.tk.tokens.create({ label: 'past', grants: ['read:*'], expiresAt: new Date(t.clock.ms - 1000) }, 'x'), 400)
+        await rejects(t.tk.tokens.create({ label: 'bad', grants: ['read:*'], expiresAt: 'tomorrow' }, 'x'), 400)
+        await rejects(t.tk.tokens.create({ label: 'both', grants: ['read:*'], expiresAt: new Date(t.clock.ms + 1000), ttlSeconds: 5 }, 'x'), 400, /not both/)
+        await rejects(t.tk.tokens.create({ label: 'zero', grants: ['read:*'], ttlSeconds: 0 }, 'x'), 400)
       } finally {
         await t.close()
       }
@@ -101,33 +112,31 @@ for (const backend of await available()) {
     test('grant and ungrant keep canonical form', async () => {
       const t = await fresh(backend)
       try {
-        const { secret } = await t.tk.tokens.create({ label: 'g', grants: ['read:a'], createdBy: 'x' })
-        let info = await t.tk.tokens.grant('g', ['write:b', 'read:a'])
+        const { secret } = await t.tk.tokens.create({ label: 'g', grants: ['read:a'] }, 'x')
+        let info = await t.tk.tokens.grant('g', ['write:b', 'read:a'], 'x')
         assert.deepEqual(info.grants, ['read:a', 'write:b'])
         assert.deepEqual((await t.tk.authenticate(secret)).grants, ['read:a', 'write:b'], 'applies on the next request')
-        info = await t.tk.tokens.ungrant(info.id, ['read:a'])
+        info = await t.tk.tokens.ungrant(info.id, ['read:a'], 'x')
         assert.deepEqual(info.grants, ['write:b'])
-        await rejects(t.tk.tokens.ungrant('g', ['read:zzz']), 400, /has no permission/)
-        await rejects(t.tk.tokens.ungrant('g', ['write:b']), 400, /revoke it instead/)
-        await rejects(t.tk.tokens.grant('nope', ['read:a']), 404)
+        await rejects(t.tk.tokens.ungrant('g', ['read:zzz'], 'x'), 400, /has no permission/)
+        await rejects(t.tk.tokens.ungrant('g', ['write:b'], 'x'), 400, /revoke it instead/)
+        await rejects(t.tk.tokens.grant('nope', ['read:a'], 'x'), 404)
       } finally {
         await t.close()
       }
     })
 
-    test('revoke applies on the next request, is recorded, and takes issued credentials with it', async () => {
+    test('revoke applies on the next request, is recorded and idempotent', async () => {
       const t = await fresh(backend)
       try {
-        const { secret, principal: issuer } = await principalWith(t.tk, 'launcher', ['turnkey:issue', 'read:*'])
-        const c = await t.tk.credentials.issue(issuer, { grants: ['read:x'], subject: { session: 's1' } })
-        assert.ok(await t.tk.authenticate(c.secret))
-        const info = await t.tk.tokens.revoke('launcher', 'alice')
+        const { secret } = await principalWith(t.tk, 'host', ['read:*'])
+        const info = await t.tk.tokens.revoke('host', 'alice')
         assert.equal(info.revokedBy, 'alice')
         assert.ok(info.revokedAt)
+        assert.equal(info.active, false)
         assert.equal(await t.tk.authenticate(secret), null)
-        assert.equal(await t.tk.authenticate(c.secret), null, "the issuer's credential went with it")
-        const again = await t.tk.tokens.revoke('launcher', 'someone-else')
-        assert.equal(again.revokedBy, 'alice', 'idempotent: the first revoke stays on record')
+        const again = await t.tk.tokens.revoke('host', 'someone-else')
+        assert.equal(again.revokedBy, 'alice', 'the first revoke stays on record')
         await rejects(t.tk.tokens.revoke('missing', 'x'), 404)
       } finally {
         await t.close()
@@ -137,7 +146,7 @@ for (const backend of await available()) {
     test('rotate replaces the secret and keeps everything else', async () => {
       const t = await fresh(backend)
       try {
-        const { token, secret } = await t.tk.tokens.create({ label: 'r', grants: ['read:*'], createdBy: 'x' })
+        const { token, secret } = await t.tk.tokens.create({ label: 'r', grants: ['read:*'] }, 'x')
         const r = await t.tk.tokens.rotate('r', 'alice')
         assert.notEqual(r.secret, secret)
         assert.equal(r.token.id, token.id)
@@ -151,15 +160,33 @@ for (const backend of await available()) {
       }
     })
 
-    test('import keeps an existing secret working', async () => {
+    test('export and import: a backup brings independent tokens back with their secrets', async () => {
       const t = await fresh(backend)
       try {
+        const keep = await principalWith(t.tk, 'keep', ['read:*', 'turnkey:issue'])
+        await t.tk.tokens.create({ label: 'dead', grants: ['read:*'] }, 'x').then(() => t.tk.tokens.revoke('dead', 'x'))
+        await t.tk.sessions.create({ grants: ['read:*'] }, 'login')
+        await childOf(t.tk, keep.principal, { name: 'job' })
+        const saved = await t.tk.tokens.export()
+        assert.deepEqual(saved.map((x) => x.label), ['keep'], 'no revoked tokens, sessions or children')
+        assert.equal(saved[0].secretHash, sha(keep.secret))
+
+        const t2 = await fresh(backend)
+        try {
+          const info = await t2.tk.tokens.import(saved[0], 'restore')
+          assert.equal(info.createdBy, 'test', 'the original record is kept')
+          assert.equal((await t2.tk.authenticate(keep.secret)).label, 'keep')
+        } finally {
+          await t2.close()
+        }
+
         const old = 'tt_existing-secret-from-another-system'
-        const info = await t.tk.tokens.import({ label: 'legacy', secretHash: sha(old), grants: ['read:*'], createdBy: 'migration', createdAt: '2025-05-05T00:00:00Z' })
-        assert.equal(info.createdAt, '2025-05-05T00:00:00.000Z')
+        const legacy = await t.tk.tokens.import({ label: 'legacy', secretHash: sha(old), grants: ['read:*'], createdAt: '2025-05-05T00:00:00Z' }, 'migration')
+        assert.equal(legacy.createdAt, '2025-05-05T00:00:00.000Z')
+        assert.equal(legacy.createdBy, 'migration')
         assert.equal((await t.tk.authenticate(old)).label, 'legacy')
-        await rejects(t.tk.tokens.import({ label: 'x', secretHash: 'nothex', grants: ['read:*'], createdBy: 'm' }), 400)
-        await rejects(t.tk.tokens.import({ label: 'y', secretHash: sha(old), grants: ['read:*'], createdBy: 'm' }), 409)
+        await rejects(t.tk.tokens.import({ label: 'x', secretHash: 'nothex', grants: ['read:*'] }, 'm'), 400)
+        await rejects(t.tk.tokens.import({ label: 'y', secretHash: sha(old), grants: ['read:*'] }, 'm'), 409)
       } finally {
         await t.close()
       }
@@ -168,17 +195,17 @@ for (const backend of await available()) {
     test('last_used_at is recorded, at most every few minutes', async () => {
       const t = await fresh(backend)
       try {
-        const { token, secret } = await t.tk.tokens.create({ label: 'u', grants: ['read:*'], createdBy: 'x' })
+        const { token, secret } = await t.tk.tokens.create({ label: 'u', grants: ['read:*'] }, 'x')
         assert.equal(token.lastUsedAt, null)
         await t.tk.authenticate(secret)
-        const first = (await t.tk.tokens.get('u')).lastUsedAt
+        const first = (await t.tk.tokens.get('u', 'x')).lastUsedAt
         assert.equal(first, t.clock.now().toISOString())
         t.clock.advance(60)
         await t.tk.authenticate(secret)
-        assert.equal((await t.tk.tokens.get('u')).lastUsedAt, first, 'not rewritten within five minutes')
+        assert.equal((await t.tk.tokens.get('u', 'x')).lastUsedAt, first, 'not rewritten within five minutes')
         t.clock.advance(300)
         await t.tk.authenticate(secret)
-        assert.equal((await t.tk.tokens.get('u')).lastUsedAt, t.clock.now().toISOString())
+        assert.equal((await t.tk.tokens.get('u', 'x')).lastUsedAt, t.clock.now().toISOString())
       } finally {
         await t.close()
       }
@@ -187,132 +214,304 @@ for (const backend of await available()) {
     test('purge deletes rows dead longer than the retention period', async () => {
       const t = await fresh(backend, { retentionDays: 1 })
       try {
-        await t.tk.tokens.create({ label: 'keep', grants: ['read:*'], createdBy: 'x' })
-        await t.tk.tokens.create({ label: 'gone', grants: ['read:*'], createdBy: 'x' })
-        await t.tk.tokens.create({ label: 'lapses', grants: ['read:*'], createdBy: 'x', expiresAt: new Date(t.clock.ms + 1000) })
+        await t.tk.tokens.create({ label: 'keep', grants: ['read:*'] }, 'x')
+        await t.tk.tokens.create({ label: 'gone', grants: ['read:*'] }, 'x')
+        await t.tk.tokens.create({ label: 'lapses', grants: ['read:*'], expiresAt: new Date(t.clock.ms + 1000) }, 'x')
         await t.tk.tokens.revoke('gone', 'x')
         t.clock.advance(3600)
         assert.equal(await t.tk.purge(), 0, 'still within retention')
         t.clock.advance(86_400)
         assert.equal(await t.tk.purge(), 2)
-        assert.deepEqual((await t.tk.tokens.list({ all: true })).map((x) => x.label), ['keep'])
+        assert.deepEqual((await t.tk.tokens.list('x', { all: true })).map((x) => x.label), ['keep'])
       } finally {
         await t.close()
       }
     })
 
-    // ------------------------------------------------------------------ credentials
+    // ------------------------------------------------------------------ the rules for principals
 
-    test('issue: needs turnkey:issue, stays within what the issuer holds, never turnkey:', async () => {
+    test('creating and granting: turnkey:manage, and only what you hold', async () => {
       const t = await fresh(backend)
       try {
-        const { principal: issuer } = await principalWith(t.tk, 'lp', ['turnkey:issue', 'write:sessions', 'read:*'])
+        const { principal: admin } = await principalWith(t.tk, 'admin', ['turnkey:manage', 'write:*'])
         const { principal: plain } = await principalWith(t.tk, 'plain', ['write:*'])
-        await assert.rejects(() => t.tk.credentials.issue(plain, { grants: ['read:x'], subject: { session: 's' } }), (e) => e.status === 403)
-        await assert.rejects(() => t.tk.credentials.issue(issuer, { grants: ['write:projects'], subject: { session: 's' } }), (e) => e.status === 403 && /write:projects/.test(e.message))
-        await assert.rejects(() => t.tk.credentials.issue(issuer, { grants: ['turnkey:issue'], subject: { session: 's' } }), (e) => e.status === 403)
-        await assert.rejects(() => t.tk.credentials.issue(issuer, { grants: [], subject: { session: 's' } }), (e) => e.status === 400)
-        await assert.rejects(() => t.tk.credentials.issue(issuer, { grants: ['bad'], subject: { session: 's' } }), (e) => e.status === 400)
+        const { principal: issuer } = await principalWith(t.tk, 'issuer', ['turnkey:issue', 'write:*'])
+        await rejects(t.tk.tokens.create({ label: 'x', grants: ['read:a'] }, plain), 403, /turnkey manage/)
+        await rejects(t.tk.tokens.create({ label: 'x', grants: ['read:a'] }, issuer), 403, /turnkey manage/)
 
-        const c = await t.tk.credentials.issue(issuer, { grants: ['write:sessions/abc', 'read:*'], ttlSeconds: 1800, subject: { session: 'Sess-ABC', agent: 'dev', host: 'h1' } })
-        assert.equal(c.label, 'lp.sess-abc')
-        assert.equal(c.expiresAt, new Date(t.clock.ms + 1800_000).toISOString())
-        assert.match(c.id, /^tok_[0-9a-f]{24}$/)
+        const made = await t.tk.tokens.create({ label: 'host', grants: ['write:things', 'turnkey:manage'] }, admin)
+        assert.equal(made.token.createdBy, 'admin')
+        assert.equal(made.token.parent, null, 'made with manage: independent')
+        await t.tk.tokens.create({ label: 'lp', grants: ['turnkey:issue', 'read:*'] }, admin)
+        await rejects(t.tk.tokens.create({ label: 'root', grants: ['*:*'] }, admin), 403, /may not give \*:\*/)
+        await rejects(t.tk.tokens.create({ label: 'adm', grants: ['admin:x'] }, admin), 403, /may not give admin:x/)
+
+        await t.tk.tokens.grant('host', ['write:other'], admin)
+        await rejects(t.tk.tokens.grant('host', ['admin:x'], admin), 403, /may not give/)
+        await rejects(t.tk.tokens.grant('host', ['read:x'], plain), 404, 'it cannot see the token')
+        await rejects(t.tk.tokens.ungrant('plain', ['write:*'], plain), 403, /turnkey manage/)
+        await rejects(t.tk.tokens.rotate('plain', plain), 403)
+        assert.equal((await t.tk.tokens.rotate('host', { ...admin, actor: 'session:s1@admin' })).token.rotatedBy, 'session:s1@admin')
+
+        // Rotating hands over the secret, and extending keeps access alive: only for what you hold.
+        await t.tk.tokens.create({ label: 'root', grants: ['*:*'], ttlSeconds: 60 }, 'service')
+        await rejects(t.tk.tokens.rotate('root', admin), 403, /may not rotate "root": it holds \*:\*/)
+        await rejects(t.tk.tokens.extend('root', { ttlSeconds: 3600 }, admin), 403, /may not extend "root"/)
+        assert.equal((await t.tk.tokens.revoke('root', admin)).active, false, 'but it may revoke it')
+        assert.equal((await t.tk.tokens.extend('host', { ttlSeconds: 60 }, admin)).expiresAt, new Date(t.clock.ms + 60_000).toISOString())
+      } finally {
+        await t.close()
+      }
+    })
+
+    test('what a principal sees: manage sees all; otherwise itself and its children', async () => {
+      const t = await fresh(backend)
+      try {
+        const { principal: admin } = await principalWith(t.tk, 'admin', ['turnkey:manage', 'read:*'])
+        const { principal: lp } = await principalWith(t.tk, 'lp', ['turnkey:issue', 'read:*'])
+        const { principal: other } = await principalWith(t.tk, 'other', ['turnkey:issue', 'read:*'])
+        const { principal: plain } = await principalWith(t.tk, 'plain', ['read:*'])
+        const mine = await childOf(t.tk, lp, { name: 's1' })
+        await childOf(t.tk, other, { name: 's1' })
+
+        assert.equal((await t.tk.tokens.list(admin)).length, 6)
+        assert.deepEqual((await t.tk.tokens.list(lp)).map((x) => x.label).sort(), ['lp', 'lp.s1'])
+        assert.deepEqual((await t.tk.tokens.list(plain)).map((x) => x.label), ['plain'])
+        assert.deepEqual((await t.tk.tokens.list(mine.principal)).map((x) => x.label), ['lp.s1'])
+        assert.deepEqual((await t.tk.tokens.list(admin, { parent: 'lp' })).map((x) => x.label), ['lp.s1'])
+        assert.deepEqual((await t.tk.tokens.list(lp, { parent: 'lp' })).map((x) => x.label), ['lp.s1'])
+        await rejects(t.tk.tokens.list(lp, { parent: 'other' }), 404)
+        assert.equal((await t.tk.tokens.get('lp.s1', lp)).parent, lp.id)
+        await rejects(t.tk.tokens.get('other.s1', lp), 404, /no token/)
+        await rejects(t.tk.tokens.get('admin', plain), 404)
+        assert.equal((await t.tk.tokens.get('plain', plain)).label, 'plain')
+      } finally {
+        await t.close()
+      }
+    })
+
+    test('revoking: manage, the parent, or the token itself', async () => {
+      const t = await fresh(backend)
+      try {
+        const { principal: admin } = await principalWith(t.tk, 'admin', ['turnkey:manage', 'read:*'])
+        const { principal: lp } = await principalWith(t.tk, 'lp', ['turnkey:issue', 'read:*'])
+        const self = await principalWith(t.tk, 'self', ['read:*'])
+        const c1 = await childOf(t.tk, lp, { name: 'a' })
+        const c2 = await childOf(t.tk, lp, { name: 'b' })
+        await rejects(t.tk.tokens.revoke('lp', c1.principal), 404, 'a child cannot see its parent')
+        await rejects(t.tk.tokens.revoke('admin', self.principal), 404)
+        assert.equal((await t.tk.tokens.revoke('self', self.principal)).revokedBy, 'self', 'logging itself out')
+        assert.equal(await t.tk.authenticate(self.secret), null)
+        assert.equal((await t.tk.tokens.revoke(c1.token.id, lp)).revokedBy, 'lp')
+        assert.equal((await t.tk.tokens.revoke('lp.b', c2.principal)).active, false, 'a child may revoke itself')
+        const c3 = await childOf(t.tk, lp, { name: 'c' })
+        assert.equal((await t.tk.tokens.revoke('lp.c', admin)).revokedBy, 'admin')
+        assert.equal(await t.tk.authenticate(c3.secret), null)
+      } finally {
+        await t.close()
+      }
+    })
+
+    // ------------------------------------------------------------------ children
+
+    test('a child: turnkey:issue, within what the parent holds, never turnkey:, labelled after its parent', async () => {
+      const t = await fresh(backend)
+      try {
+        const { principal: lp } = await principalWith(t.tk, 'lp', ['turnkey:issue', 'write:sessions', 'read:*'])
+        const { principal: plain } = await principalWith(t.tk, 'plain', ['write:*'])
+        const child = (input, actor = lp) => t.tk.tokens.create({ name: 's', ...input, child: true }, actor)
+        await rejects(child({ grants: ['read:x'] }, plain), 403, /turnkey issue/)
+        await rejects(child({ grants: ['read:x'] }, 'service'), 400, /created by its parent/)
+        await rejects(child({ grants: ['write:projects'] }), 403, /write:projects/)
+        await rejects(child({ grants: ['turnkey:issue'] }), 403, /child token may not hold/)
+        await rejects(child({ grants: [] }), 400)
+        await rejects(child({ grants: ['bad'] }), 400)
+        await rejects(child({ label: 'x', grants: ['read:x'] }), 400, /give name, not label/)
+
+        const c = await child({ name: 'Sess-ABC', grants: ['write:sessions/abc', 'read:*'], ttlSeconds: 1800, subject: { session: 'Sess-ABC', agent: 'dev', host: 'h1' } })
+        assert.equal(c.token.label, 'lp.sess-abc')
+        assert.equal(c.token.parent, lp.id)
+        assert.equal(c.token.createdBy, 'lp')
+        assert.equal(c.token.expiresAt, new Date(t.clock.ms + 1800_000).toISOString())
+        assert.match(c.token.id, /^tok_[0-9a-f]{24}$/)
         const p = await t.tk.authenticate(c.secret)
-        assert.equal(p.kind, 'credential')
-        assert.equal(p.issuedBy, issuer.id)
+        assert.equal(p.parent, lp.id)
         assert.deepEqual(p.subject, { session: 'Sess-ABC', agent: 'dev', host: 'h1' })
         assert.ok(t.tk.can(p, 'write', 'sessions/abc'))
         assert.ok(!t.tk.can(p, 'write', 'sessions/abd'))
 
-        const capped = await t.tk.credentials.issue(issuer, { grants: ['read:*'], ttlSeconds: 99_999, subject: { session: 'Sess-ABC' } })
-        assert.equal(capped.expiresAt, new Date(t.clock.ms + 3600_000).toISOString(), 'capped at maxTtlSeconds')
-        assert.notEqual(capped.label, c.label, 'a second credential for one session gets its own label')
-        assert.ok(capped.label.startsWith('lp.sess-abc.'))
+        const capped = await child({ name: 'Sess-ABC', grants: ['read:*'], ttlSeconds: 99_999 })
+        assert.equal(capped.token.expiresAt, new Date(t.clock.ms + 3600_000).toISOString(), 'capped at children.maxTtlSeconds')
+        assert.notEqual(capped.token.label, c.token.label, 'a second child with one name gets its own label')
+        assert.ok(capped.token.label.startsWith('lp.sess-abc.'))
+        const byDate = await child({ name: 'later', grants: ['read:*'], expiresAt: new Date(t.clock.ms + 7200_000) })
+        assert.equal(byDate.token.expiresAt, new Date(t.clock.ms + 3600_000).toISOString(), 'an expiresAt is capped too')
+        const unnamed = await t.tk.tokens.create({ grants: ['read:*'], child: true }, lp)
+        assert.match(unnamed.token.label, /^lp\.[0-9a-f]{8}$/)
+
+        const plan = await t.tk.tokens.check({ name: 'dry', grants: ['read:x'], child: true }, lp)
+        assert.deepEqual(plan, { label: 'lp.dry', grants: ['read:x'], parent: lp.id, expiresAt: new Date(t.clock.ms + 3600_000).toISOString() })
+        await rejects(t.tk.tokens.check({ grants: ['write:projects'], child: true }, lp), 403)
+        assert.equal((await t.tk.tokens.list(lp, { all: true })).length, 5, 'a dry run makes nothing')
       } finally {
         await t.close()
       }
     })
 
-    test('an issued credential never passes a turnkey check, whatever it holds', async () => {
+    test('a child never passes a turnkey check, whatever it holds', async () => {
       const t = await fresh(backend)
       try {
         const { principal: root } = await principalWith(t.tk, 'root', ['*:*'])
         assert.ok(t.tk.can(root, 'turnkey', 'manage'))
-        assert.ok(t.tk.can(root, 'turnkey', 'issue'))
-        const c = await t.tk.credentials.issue(root, { grants: ['*:*'], subject: { session: 's' } })
-        const p = await t.tk.authenticate(c.secret)
+        const c = await childOf(t.tk, root, { grants: ['*:*'] })
+        const p = c.principal
         assert.ok(t.tk.can(p, 'write', 'anything'))
         assert.ok(!t.tk.can(p, 'turnkey', 'manage'))
         assert.ok(!t.tk.can(p, 'turnkey', 'issue'))
-        assert.throws(() => t.tk.require(p, 'turnkey', 'manage'), /issued credential/)
-        await assert.rejects(() => t.tk.credentials.issue(p, { grants: ['read:x'], subject: { session: 's2' } }), (e) => e.status === 403)
-        await rejects(t.tk.tokens.rotate(c.id, 'x'), 400, /never rotated/)
+        assert.throws(() => t.tk.require(p, 'turnkey', 'manage'), /a child token never may/)
+        await rejects(t.tk.tokens.create({ grants: ['read:x'], child: true }, p), 403, 'no grandchildren')
+        await rejects(t.tk.tokens.create({ label: 'x', grants: ['read:x'] }, p), 403)
+        await rejects(t.tk.tokens.extend(c.token.id, { ttlSeconds: 60 }, p), 403, /only its parent/)
+        await rejects(t.tk.tokens.rotate(c.token.id, root), 400, /child token/)
+        await rejects(t.tk.tokens.grant(c.token.id, ['read:x'], root), 400, /fixed/)
+        await rejects(t.tk.tokens.ungrant(c.token.id, ['*:*'], 'service'), 400, /fixed/)
       } finally {
         await t.close()
       }
     })
 
-    test('renew moves only the expiry; 404 once revoked or expired', async () => {
+    test('extend moves only the expiry, within the cap; 404 once revoked or expired', async () => {
       const t = await fresh(backend)
       try {
-        const { principal: issuer } = await principalWith(t.tk, 'lp', ['turnkey:issue', 'read:*'])
+        const { principal: lp } = await principalWith(t.tk, 'lp', ['turnkey:issue', 'read:*'])
         const { principal: other } = await principalWith(t.tk, 'other', ['turnkey:issue', 'read:*'])
-        const c = await t.tk.credentials.issue(issuer, { grants: ['read:x'], ttlSeconds: 1800, subject: { session: 's' } })
+        const { principal: admin } = await principalWith(t.tk, 'admin', ['turnkey:manage', 'read:*'])
+        const c = await childOf(t.tk, lp, { name: 's', grants: ['read:x'], ttlSeconds: 1800 })
         t.clock.advance(600)
-        const r = await t.tk.credentials.renew(issuer, c.id, 1800)
+        const r = await t.tk.tokens.extend(c.token.id, { ttlSeconds: 1800 }, lp)
         assert.equal(r.expiresAt, new Date(t.clock.ms + 1800_000).toISOString())
-        assert.ok(await t.tk.authenticate(c.secret), 'the secret is unchanged')
-        assert.equal((await t.tk.authenticate(c.secret)).expiresAt, r.expiresAt)
-        await rejects(t.tk.credentials.renew(other, c.id, 1800), 404, /no credential/)
-        await rejects(t.tk.credentials.renew(issuer, 'tok_nope', 1800), 404)
-        await rejects(t.tk.credentials.renew(issuer, c.id, 0), 400)
-        t.clock.advance(1801)
-        await assert.rejects(() => t.tk.credentials.renew(issuer, c.id, 1800), (e) => e.status === 404 && e.code === 'not_found')
+        assert.equal((await t.tk.authenticate(c.secret)).expiresAt, r.expiresAt, 'the secret is unchanged')
+        assert.equal((await t.tk.tokens.extend(c.token.id, {}, lp)).expiresAt, new Date(t.clock.ms + 3600_000).toISOString(), 'default: the cap')
+        assert.equal((await t.tk.tokens.extend(c.token.id, { ttlSeconds: 99_999 }, admin)).expiresAt, new Date(t.clock.ms + 3600_000).toISOString(), 'capped, even for manage')
+        await rejects(t.tk.tokens.extend(c.token.id, { ttlSeconds: 1800 }, other), 404, /no token/)
+        await rejects(t.tk.tokens.extend('tok_nope', { ttlSeconds: 1800 }, lp), 404)
+        await rejects(t.tk.tokens.extend(c.token.id, { ttlSeconds: 0 }, lp), 400)
+        await rejects(t.tk.tokens.extend('lp', { ttlSeconds: 60 }, lp), 403, 'a token cannot extend itself')
+        t.clock.advance(3601)
+        await assert.rejects(() => t.tk.tokens.extend(c.token.id, { ttlSeconds: 1800 }, lp), (e) => e.status === 404 && e.code === 'not_found')
         assert.equal(await t.tk.authenticate(c.secret), null)
 
-        const d = await t.tk.credentials.issue(issuer, { grants: ['read:x'], subject: { session: 's2' } })
-        await t.tk.credentials.revoke(issuer, d.id)
-        await rejects(t.tk.credentials.renew(issuer, d.id), 404)
+        const d = await childOf(t.tk, lp, { name: 's2' })
+        await t.tk.tokens.revoke(d.token.id, lp)
+        await rejects(t.tk.tokens.extend(d.token.id, {}, lp), 404)
+
+        const tmp = await t.tk.tokens.create({ label: 'tmp', grants: ['read:*'], ttlSeconds: 60 }, 'x')
+        assert.equal((await t.tk.tokens.extend('tmp', { ttlSeconds: 86_400 * 365 }, admin)).expiresAt, new Date(t.clock.ms + 86_400_000 * 365).toISOString(), 'no cap for an independent token')
+        await rejects(t.tk.tokens.extend('tmp', {}, admin), 400, /give ttlSeconds or expiresAt/)
+        assert.ok(await t.tk.authenticate(tmp.secret))
       } finally {
         await t.close()
       }
     })
 
-    test('renew is refused once the issuer no longer holds the permissions', async () => {
+    test('a child works only while its parent does, and only with what its parent still holds', async () => {
       const t = await fresh(backend)
       try {
-        await t.tk.tokens.create({ label: 'lp', grants: ['turnkey:issue', 'write:a', 'read:b'], createdBy: 'x' })
-        const { secret } = await t.tk.tokens.rotate('lp', 'x')
-        const issuer = await t.tk.authenticate(secret)
-        const c = await t.tk.credentials.issue(issuer, { grants: ['write:a'], subject: { session: 's' } })
-        await t.tk.tokens.ungrant('lp', ['write:a'])
-        const narrowed = await t.tk.authenticate(secret)
-        await assert.rejects(() => t.tk.credentials.renew(narrowed, c.id, 60), (e) => e.status === 403 && /write:a/.test(e.message))
-        await t.tk.tokens.ungrant('lp', ['turnkey:issue'])
-        const noIssue = await t.tk.authenticate(secret)
-        await assert.rejects(() => t.tk.credentials.renew(noIssue, c.id, 60), (e) => e.status === 403)
+        const parent = await principalWith(t.tk, 'lp', ['turnkey:issue', 'write:a', 'read:b'])
+        const c = await childOf(t.tk, parent.principal, { name: 's', grants: ['write:a', 'read:b'] })
+        assert.deepEqual(c.principal.grants, ['read:b', 'write:a'])
+
+        await t.tk.tokens.ungrant('lp', ['write:a'], 'x')
+        assert.deepEqual((await t.tk.authenticate(c.secret)).grants, ['read:b'], 'narrowed on the next request')
+        await t.tk.tokens.grant('lp', ['write:a'], 'x')
+        assert.deepEqual((await t.tk.authenticate(c.secret)).grants, ['read:b', 'write:a'])
+        await t.tk.tokens.ungrant('lp', ['turnkey:issue'], 'x')
+        assert.equal(await t.tk.authenticate(c.secret), null, 'a parent that may no longer issue')
+        await t.tk.tokens.grant('lp', ['turnkey:manage'], 'x')
+        assert.ok(await t.tk.authenticate(c.secret), 'manage includes issue')
+
+        await t.tk.tokens.revoke('lp', 'x')
+        assert.equal(await t.tk.authenticate(c.secret), null, 'gone with its parent, at once')
+        const info = await t.tk.tokens.get(c.token.id, 'x')
+        assert.equal(info.active, false)
+        assert.equal(info.revokedAt, null, 'nothing was written to the child')
+
+        const p2 = await principalWith(t.tk, 'short', ['turnkey:issue', 'read:*'])
+        await t.tk.tokens.extend('short', { ttlSeconds: 60 }, 'x')
+        const c2 = await childOf(t.tk, (await t.tk.authenticate(p2.secret)), { name: 's' })
+        t.clock.advance(61)
+        assert.equal(await t.tk.authenticate(c2.secret), null, 'gone when its parent expires')
+
+        const p3 = await principalWith(t.tk, 'gone', ['turnkey:issue', 'read:*'])
+        const c3 = await childOf(t.tk, p3.principal, { name: 's' })
+        await t.env.raw.run(`DELETE FROM ${t.env.prefix}tokens WHERE id = ?`, [p3.token.id])
+        assert.equal(await t.tk.authenticate(c3.secret), null, 'and when its parent was purged')
       } finally {
         await t.close()
       }
     })
 
-    test('credential revoke is idempotent and scoped to its issuer', async () => {
+    test('child labels: never another parent\'s dead label, always <parent>.<name>, and a long parent label is refused', async () => {
       const t = await fresh(backend)
       try {
-        const { principal: issuer } = await principalWith(t.tk, 'lp', ['turnkey:issue', 'read:*'])
-        const { principal: other } = await principalWith(t.tk, 'other', ['turnkey:issue', 'read:*'])
-        const c = await t.tk.credentials.issue(issuer, { grants: ['read:x'], subject: { session: 's' } })
-        assert.deepEqual(await t.tk.credentials.revoke(other, c.id), { id: c.id, revoked: false })
-        assert.ok(await t.tk.authenticate(c.secret), "another issuer can't revoke it")
-        assert.deepEqual(await t.tk.credentials.revoke(issuer, c.id), { id: c.id, revoked: true })
-        assert.deepEqual(await t.tk.credentials.revoke(issuer, c.id), { id: c.id, revoked: false })
-        assert.deepEqual(await t.tk.credentials.revoke(issuer, 'tok_unknown'), { id: 'tok_unknown', revoked: false })
+        const { principal: orch } = await principalWith(t.tk, 'orch', ['turnkey:issue', 'read:*'])
+        await t.tk.tokens.create({ label: 'orch.admin', grants: ['read:*'] }, 'x')
+        const dead = await t.tk.tokens.revoke('orch.admin', 'x')
+        const c = await childOf(t.tk, orch, { name: 'admin' })
+        assert.notEqual(c.token.label, 'orch.admin', 'the revoked token keeps its label and record')
+        assert.match(c.token.label, /^orch\.admin\.[0-9a-z]+$/)
+        assert.equal((await t.tk.tokens.get(dead.id, 'x')).revokedBy, 'x')
+        // The parent's own dead child label is reused.
+        const c1 = await childOf(t.tk, orch, { name: 'job' })
+        await t.tk.tokens.revoke(c1.token.id, orch)
+        assert.equal((await childOf(t.tk, orch, { name: 'job' })).token.label, 'orch.job')
+
+        const long = 'p'.repeat(100)
+        const { principal: lp } = await principalWith(t.tk, long, ['turnkey:issue', 'read:*'])
+        const named = await childOf(t.tk, lp, { name: 'x'.repeat(50) })
+        assert.equal(named.token.label, `${long}.${'x'.repeat(19)}`)
+        const { principal: tooLong } = await principalWith(t.tk, 'q'.repeat(125), ['turnkey:issue', 'read:*'])
+        await rejects(childOf(t.tk, tooLong, { name: 'a' }), 400, /too long a label/)
+      } finally {
+        await t.close()
+      }
+    })
+
+    test('a child is active exactly when it authenticates; coversAll applies the child rule; bad ttls are a 400', async () => {
+      const t = await fresh(backend)
+      try {
+        const root = await principalWith(t.tk, 'root', ['*:*'])
+        const big = await childOf(t.tk, root.principal, { name: 's', grants: ['*:*'] })
+        assert.ok(!t.tk.coversAll(big.principal, ['turnkey:manage']))
+        assert.ok(t.tk.coversAll(big.principal, ['write:x']))
+        await principalWith(t.tk, 'lp', ['turnkey:issue', 'write:*'])
+        const p = await t.tk.authenticate((await t.tk.tokens.rotate('lp', 'x')).secret)
+        const c = await childOf(t.tk, p, { name: 's', grants: ['write:x'] })
+        await t.tk.tokens.ungrant('lp', ['turnkey:issue'], 'x')
         assert.equal(await t.tk.authenticate(c.secret), null)
-        const mine = await t.tk.credentials.issue(issuer, { grants: ['read:x'], subject: { session: 'z' } })
-        await t.tk.credentials.issue(other, { grants: ['read:x'], subject: { session: 'z' } })
-        assert.deepEqual((await t.tk.credentials.list(issuer)).map((x) => x.id), [mine.id])
-        assert.equal((await t.tk.credentials.list()).length, 2)
+        assert.equal((await t.tk.tokens.get(c.token.id, 'x')).active, false)
+        assert.equal((await t.tk.tokens.list('x')).some((x) => x.id === c.token.id), false)
+
+        const { principal: lp2 } = await principalWith(t.tk, 'lp2', ['turnkey:issue', 'read:*'])
+        for (const ttlSeconds of [1e17, 1.5, -1, '60', [5], true]) {
+          await rejects(t.tk.tokens.create({ name: 'n', grants: ['read:*'], ttlSeconds, child: true }, lp2), 400, JSON.stringify(ttlSeconds))
+        }
+        await rejects(t.tk.tokens.create({ label: 'big', grants: ['read:*'], ttlSeconds: 1e17 }, 'x'), 400)
+      } finally {
+        await t.close()
+      }
+    })
+
+    test('a dry run sees a label conflict; session labels are reserved; a child\'s grants are a 400 to its parent too', async () => {
+      const t = await fresh(backend)
+      try {
+        const { principal: admin } = await principalWith(t.tk, 'admin', ['turnkey:manage', 'read:*'])
+        await rejects(t.tk.tokens.check({ label: 'admin', grants: ['read:*'] }, admin), 409)
+        await rejects(t.tk.tokens.create({ label: 'session.abc', grants: ['read:*'] }, 'x'), 400, /browser sessions/)
+        const { principal: lp } = await principalWith(t.tk, 'lp', ['turnkey:issue', 'read:*'])
+        const c = await childOf(t.tk, lp, { name: 's' })
+        await rejects(t.tk.tokens.grant(c.token.id, ['read:x'], lp), 400, /fixed/)
+        await rejects(t.tk.tokens.rotate(c.token.id, lp), 400, /fixed/)
       } finally {
         await t.close()
       }
@@ -323,13 +522,14 @@ for (const backend of await available()) {
     test('browser sessions expire, slide forward while used, and log out', async () => {
       const t = await fresh(backend, { sessions: { ttlSeconds: 86_400 } })
       try {
-        const { token, secret } = await t.tk.sessions.create({ grants: ['admin:*', 'turnkey:manage'], createdBy: 'password-login', subject: { userAgent: 'test' } })
-        assert.equal(token.kind, 'session')
+        const { token, secret } = await t.tk.sessions.create({ grants: ['admin:*', 'turnkey:manage'], subject: { userAgent: 'test' } }, 'password-login')
         assert.match(token.label, /^session\.[0-9a-f]{12}$/)
         assert.equal(token.slideSeconds, 86_400)
+        assert.equal(token.createdBy, 'password-login')
         let p = await t.tk.authenticate(secret)
         assert.equal(p.renewed, false)
-        assert.ok(t.tk.can(p, 'turnkey', 'manage'), 'a session (not an issued credential) may manage tokens')
+        assert.equal(p.slideSeconds, 86_400)
+        assert.ok(t.tk.can(p, 'turnkey', 'manage'), 'a session may manage tokens')
         t.clock.advance(3 * 3600)
         p = await t.tk.authenticate(secret)
         assert.equal(p.renewed, true)
@@ -341,19 +541,20 @@ for (const backend of await available()) {
         t.clock.advance(86_401)
         assert.equal(await t.tk.authenticate(secret), null, 'idle longer than the ttl: expired')
 
-        const fixed = await t.tk.sessions.create({ grants: ['read:*'], createdBy: 'x', ttlSeconds: 100, slide: false })
+        const fixed = await t.tk.sessions.create({ grants: ['read:*'], ttlSeconds: 100, slide: false }, 'x')
         t.clock.advance(50)
         assert.equal((await t.tk.authenticate(fixed.secret)).renewed, false)
         t.clock.advance(51)
         assert.equal(await t.tk.authenticate(fixed.secret), null)
 
-        const a = await t.tk.sessions.create({ grants: ['read:*'], createdBy: 'x' })
-        const b = await t.tk.sessions.create({ grants: ['read:*'], createdBy: 'x' })
-        const tok = await t.tk.tokens.create({ label: 'cli', grants: ['read:*'], createdBy: 'x' })
-        await t.tk.sessions.revoke(await t.tk.authenticate(a.secret), 'logout')
-        assert.equal(await t.tk.authenticate(a.secret), null)
+        const a = await t.tk.sessions.create({ grants: ['read:*'] }, 'x')
+        const b = await t.tk.sessions.create({ grants: ['read:*'] }, 'x')
+        const tok = await t.tk.tokens.create({ label: 'cli', grants: ['read:*'] }, 'x')
+        const pa = await t.tk.authenticate(a.secret)
+        await t.tk.tokens.revoke(pa.id, pa)
+        assert.equal(await t.tk.authenticate(a.secret), null, 'logout: the session revokes itself')
         assert.ok(await t.tk.authenticate(b.secret))
-        await rejects(t.tk.sessions.revoke('cli', 'x'), 400)
+        assert.deepEqual((await t.tk.sessions.list()).map((s) => s.id), [b.token.id])
         assert.equal(await t.tk.sessions.revokeAll('password-changed'), 1)
         assert.equal(await t.tk.authenticate(b.secret), null)
         assert.ok(await t.tk.authenticate(tok.secret), 'tokens are not sessions')
@@ -367,17 +568,57 @@ for (const backend of await available()) {
     test('migrations: recorded once, a restart is a no-op', async () => {
       const t = await fresh(backend)
       try {
-        const rows = await t.env.raw.query(`SELECT version, name, checksum FROM ${t.env.prefix}migrations`)
-        assert.equal(rows.length, 1)
-        assert.equal(Number(rows[0].version), 1)
+        const rows = await t.env.raw.query(`SELECT version, name, checksum FROM ${t.env.prefix}migrations ORDER BY version`)
+        assert.deepEqual(rows.map((r) => Number(r.version)), [1, 2])
         assert.match(String(rows[0].checksum), /^[0-9a-f]{64}$/)
-        const { secret } = await t.tk.tokens.create({ label: 'kept', grants: ['read:*'], createdBy: 'x' })
+        const { secret } = await t.tk.tokens.create({ label: 'kept', grants: ['read:*'] }, 'x')
         const again = await createTurnkey({ db: t.env.driver, tablePrefix: t.env.prefix, tokenPrefix: 'tt_', permissions: PERMISSIONS, purgeIntervalMs: false, now: t.clock.now })
         assert.ok(await again.authenticate(secret))
-        assert.equal((await t.env.raw.query(`SELECT version FROM ${t.env.prefix}migrations`)).length, 1)
+        assert.equal((await t.env.raw.query(`SELECT version FROM ${t.env.prefix}migrations`)).length, 2)
         await again.close()
       } finally {
         await t.close()
+      }
+    })
+
+    test('migrations: a 0.1 database (kinds, issued_by) upgrades with its tokens working', async () => {
+      const env = await backend.open()
+      try {
+        const schema = await import('../dist/schema.js')
+        const d = env.driver.dialect
+        const P = env.prefix
+        await env.raw.run(schema.withPrefix(schema.MIGRATIONS_TABLE(d), P))
+        const v1 = schema.MIGRATIONS[0]
+        for (const st of v1.statements[d]) await env.raw.run(schema.withPrefix(st, P))
+        await env.raw.run(`INSERT INTO ${P}migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`, [1, v1.name, schema.checksum(v1, d), '2026-01-01T00:00:00.000Z'])
+        const c = clock()
+        const later = new Date(c.ms + 1800_000).toISOString()
+        const row = (id, label, kind, secret, grants, issuedBy, expires, slide) =>
+          env.raw.run(
+            `INSERT INTO ${P}tokens (id, label, kind, secret_hash, grants, issued_by, expires_at, slide_seconds, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [id, label, kind, sha(secret), grants, issuedBy, expires, slide, '2026-01-01T00:00:00.000Z', 'old'],
+          )
+        await row('tok_1', 'lp', 'token', 'tt_issuer', 'read:* turnkey:issue', null, null, null)
+        await row('tok_2', 'lp.s1', 'credential', 'tt_cred', 'read:x', 'tok_1', later, null)
+        await row('tok_3', 'session.abc', 'session', 'tt_sess', 'read:*', null, later, 86400)
+
+        const tk = await createTurnkey({ db: env.driver, tablePrefix: P, tokenPrefix: 'tt_', permissions: PERMISSIONS, purgeIntervalMs: false, now: c.now })
+        try {
+          const versions = (await env.raw.query(`SELECT version FROM ${P}migrations ORDER BY version`)).map((r) => Number(r.version))
+          assert.deepEqual(versions, [1, 2])
+          const cred = await tk.authenticate('tt_cred')
+          assert.equal(cred.parent, 'tok_1', 'a credential is now a child of its issuer')
+          assert.deepEqual(cred.grants, ['read:x'])
+          assert.equal((await tk.authenticate('tt_sess')).slideSeconds, 86400)
+          const issuer = await tk.authenticate('tt_issuer')
+          assert.deepEqual((await tk.tokens.list(issuer)).map((x) => x.label).sort(), ['lp', 'lp.s1'])
+          await tk.tokens.revoke('lp', 'x')
+          assert.equal(await tk.authenticate('tt_cred'), null)
+        } finally {
+          await tk.close()
+        }
+      } finally {
+        await env.close()
       }
     })
 
@@ -405,7 +646,7 @@ for (const backend of await available()) {
       try {
         const opts = { db: env.driver, tablePrefix: env.prefix, permissions: PERMISSIONS, purgeIntervalMs: false }
         const all = await Promise.all([1, 2, 3, 4].map(() => createTurnkey(opts)))
-        assert.equal((await env.raw.query(`SELECT version FROM ${env.prefix}migrations`)).length, 1)
+        assert.equal((await env.raw.query(`SELECT version FROM ${env.prefix}migrations`)).length, 2)
         await Promise.all(all.map((x) => x.close()))
       } finally {
         await env.close()
@@ -419,7 +660,7 @@ for (const backend of await available()) {
         await assert.rejects(() => createTurnkey({ ...base, tablePrefix: 'Bad-Prefix' }), /tablePrefix/)
         await assert.rejects(() => createTurnkey({ ...base, tokenPrefix: 'has space' }), /tokenPrefix/)
         await assert.rejects(() => createTurnkey({ ...base, permissions: { actions: ['turnkey'] } }), /reserved/)
-        await assert.rejects(() => createTurnkey({ ...base, credentials: { maxTtlSeconds: 0 } }), /maxTtlSeconds/)
+        await assert.rejects(() => createTurnkey({ ...base, children: { maxTtlSeconds: 0 } }), /maxTtlSeconds/)
       } finally {
         await env.close()
       }
@@ -439,9 +680,9 @@ for (const backend of await available()) {
           const commits = async () => Number((await t.env.raw.query('SELECT COUNT(*) AS n FROM dolt_log'))[0].n)
           const before = await commits()
           const { principal: issuer } = await principalWith(t.tk, 'lp', ['turnkey:issue', 'read:*'])
-          const c = await t.tk.credentials.issue(issuer, { grants: ['read:x'], subject: { session: 's' } })
-          for (let i = 0; i < 5; i++) await t.tk.credentials.renew(issuer, c.id, 600)
-          assert.equal(await commits(), before, 'no commits from issuing or renewing')
+          const c = await childOf(t.tk, issuer, { name: 's', grants: ['read:x'] })
+          for (let i = 0; i < 5; i++) await t.tk.tokens.extend(c.token.id, { ttlSeconds: 600 }, issuer)
+          assert.equal(await commits(), before, 'no commits from creating or extending')
           // The service commits its own change with -A: Turnkey's tables stay out.
           await t.env.raw.run('INSERT INTO app_things VALUES (1)')
           await t.env.raw.query("CALL DOLT_ADD('-A')")
@@ -458,7 +699,7 @@ for (const backend of await available()) {
       test('Dolt: after a restore drops the tables and the ignore rule, startup redoes both', async () => {
         const t = await fresh(backend)
         try {
-          await t.tk.tokens.create({ label: 'old', grants: ['read:*'], createdBy: 'x' })
+          await t.tk.tokens.create({ label: 'old', grants: ['read:*'] }, 'x')
           // A restore from a commit taken before Turnkey existed: no ignore rule, no tables.
           await t.env.raw.run('DROP TABLE turnkey_tokens')
           await t.env.raw.run('DROP TABLE turnkey_migrations')
@@ -470,7 +711,7 @@ for (const backend of await available()) {
           assert.equal(Number(ig.ignored), 1)
           const [log] = await t.env.raw.query('SELECT committer, email FROM dolt_log LIMIT 1')
           assert.equal(log.committer, 'Svc')
-          assert.equal((await tk2.tokens.list({ all: true })).length, 0)
+          assert.equal((await tk2.tokens.list('x', { all: true })).length, 0)
           await tk2.close()
         } finally {
           await t.close()

@@ -1,8 +1,8 @@
 // Framework-neutral HTTP pieces the adapters share: reading a request's credentials (a Bearer
-// header or a session cookie), session cookies, and the credential contract's five routes as a
-// plain function from a request to a status and JSON body.
+// header or a session cookie), session cookies, and Turnkey's token API as a plain function from a
+// request to a status and JSON body.
 import { TurnkeyError, unauthorized, badRequest, forbidden } from './errors.js'
-import type { Principal, Turnkey } from './turnkey.js'
+import type { CreateTokenInput, Principal, Turnkey } from './turnkey.js'
 
 // -------------------------------------------------------------------- cookies
 
@@ -132,91 +132,121 @@ export function errorResponse(err: unknown, log?: (msg: string) => void): JsonRe
   return { status: 500, body: { error: 'internal error', code: 'internal' } }
 }
 
-// -------------------------------------------------------------------- the credential contract
+// -------------------------------------------------------------------- the token API
 
-export interface CredentialRoutesOptions {
-  /** The service's name, returned by `describe`. */
-  service: string
-  /** What the `token` value is, for `describe`. */
-  tokenDescription?: string
-  /** How to write permissions, for `describe`. */
-  permissionsHelp?: string
+export interface RoutesOptions {
   /** Where unexpected errors are logged. Default `console.error`. */
   log?: (msg: string) => void
 }
 
-export interface ContractRequest {
+export interface ApiRequest {
   method: string
-  /** The path below the mount point: `/describe`, `/issue`, … */
-  path: string
+  /** The path below the mount point, with any query string: `/tokens?all=true`, `/tokens/ci/extend`. */
+  url: string
   authorization?: string | null
   /** The parsed JSON body (POST only). */
   body?: unknown
 }
 
 /**
- * The credential contract's routes (`describe`, `validate`, `issue`, `renew`, `revoke`) as one
- * function. Returns null for a path it doesn't serve, so the caller can fall through.
+ * Turnkey's HTTP API (docs/api.md) as one function. Every call needs a token as
+ * `Authorization: Bearer`, and gets the same rules as the library. Returns null for a path it
+ * doesn't serve, so the caller can fall through.
  */
-export function credentialRoutes(tk: Turnkey, opts: CredentialRoutesOptions): (req: ContractRequest) => Promise<JsonResponse | null> {
+export function turnkeyRoutes(tk: Turnkey, opts: RoutesOptions = {}): (req: ApiRequest) => Promise<JsonResponse | null> {
   const log = opts.log ?? ((m: string) => console.error(m))
-  const routes: Record<string, (issuer: Principal, body: Record<string, unknown>) => Promise<unknown>> = {
-    'GET /describe': async (issuer) => {
-      tk.credentials.assertIssuer(issuer)
-      return {
-        service: opts.service,
-        maxTtlSeconds: tk.maxCredentialTtl,
-        values: { token: opts.tokenDescription ?? `A ${opts.service} token (Authorization: Bearer ${tk.tokenPrefix}…) with the granted permissions` },
-        permissions: opts.permissionsHelp ?? '{"grants": ["<action>:<resource>", ...]}: each within what the issuer holds',
-        grants: issuer.grants.filter((g) => !g.startsWith('turnkey:')),
-      }
+  type Handler = (who: Principal, body: Record<string, unknown>, ref: string, query: URLSearchParams) => Promise<JsonResponse>
+  const ok = async (body: Promise<unknown> | unknown): Promise<JsonResponse> => ({ status: 200, body: await body })
+  const routes: Record<string, Handler> = {
+    'GET /self': async (who) => ok({ ...(await tk.tokens.get(who.id, who)), grants: who.grants, maxChildTtlSeconds: tk.maxChildTtl }),
+    'GET /tokens': async (who, _b, _r, q) =>
+      ok({ tokens: await tk.tokens.list(who, { all: q.get('all') === 'true', ...(q.get('parent') ? { parent: q.get('parent')! } : {}) }) }),
+    'POST /tokens': async (who, body) => {
+      const input = createInput(body)
+      if (body.dryRun === true) return ok({ dryRun: true, ...(await tk.tokens.check(input, who)) })
+      return { status: 201, body: await tk.tokens.create(input, who) }
     },
-    'POST /validate': async (issuer, body) => ({ ok: true, grants: tk.credentials.check(issuer, permissionGrants(body.permissions)) }),
-    'POST /issue': async (issuer, body) => {
-      const subject = body.subject
-      if (!subject || typeof subject !== 'object' || Array.isArray(subject)) throw badRequest('subject must be {session, agent, host}')
-      if (typeof (subject as Record<string, unknown>).session !== 'string' || !(subject as Record<string, unknown>).session) {
-        throw badRequest('subject.session is required')
-      }
-      const c = await tk.credentials.issue(issuer, {
-        grants: permissionGrants(body.permissions),
-        ttlSeconds: body.ttlSeconds as number | undefined,
-        subject: subject as Record<string, unknown>,
-      })
-      return { id: c.id, expiresAt: c.expiresAt, values: { token: c.secret } }
+    'GET /tokens/:ref': async (who, _b, ref) => ok(tk.tokens.get(ref, who)),
+    'POST /tokens/:ref/extend': async (who, body, ref) => {
+      only(body, ['ttlSeconds', 'expiresAt'])
+      ttlField(body)
+      if (body.expiresAt != null && typeof body.expiresAt !== 'string') throw badRequest('expiresAt must be a string')
+      return ok(tk.tokens.extend(ref, { ttlSeconds: body.ttlSeconds as number | undefined, expiresAt: body.expiresAt as string | undefined }, who))
     },
-    'POST /renew': async (issuer, body) => tk.credentials.renew(issuer, String(body.id ?? ''), body.ttlSeconds as number | undefined),
-    'POST /revoke': async (issuer, body) => tk.credentials.revoke(issuer, String(body.id ?? '')),
+    'POST /tokens/:ref/revoke': async (who, body, ref) => (only(body, []), ok(tk.tokens.revoke(ref, who))),
+    'POST /tokens/:ref/grant': async (who, body, ref) => (only(body, ['grants']), ok(tk.tokens.grant(ref, grantsOf(body), who))),
+    'POST /tokens/:ref/ungrant': async (who, body, ref) => (only(body, ['grants']), ok(tk.tokens.ungrant(ref, grantsOf(body), who))),
+    'POST /tokens/:ref/rotate': async (who, body, ref) => (only(body, []), ok(tk.tokens.rotate(ref, who))),
+  }
+  const match = (method: string, path: string): { key: string; ref: string } | null | 'method' => {
+    const parts = path.split('/').filter(Boolean)
+    let ref = ''
+    let shape = '/' + parts.join('/')
+    if (parts[0] === 'tokens' && parts.length >= 2 && parts.length <= 3) {
+      try {
+        ref = decodeURIComponent(parts[1]!)
+      } catch {
+        return null
+      }
+      shape = ['', 'tokens', ':ref', ...parts.slice(2)].join('/')
+    }
+    const key = `${method.toUpperCase()} ${shape}`
+    if (key in routes) return { key, ref }
+    return Object.keys(routes).some((k) => k.endsWith(` ${shape}`)) ? 'method' : null
   }
   return async (req) => {
-    const path = '/' + req.path.replace(/^\/+|\/+$/g, '')
-    const route = routes[`${req.method.toUpperCase()} ${path}`]
-    if (!route) {
-      const known = Object.keys(routes).some((k) => k.endsWith(` ${path}`))
-      return known ? { status: 405, body: { error: `method ${req.method} not allowed here`, code: 'method_not_allowed' } } : null
-    }
+    // Prefixed, so a path starting `//` stays a path rather than becoming a host.
+    const u = new URL('http://x' + (req.url?.startsWith('/') ? req.url : `/${req.url ?? ''}`))
+    const m = match(req.method, u.pathname.replace(/\/+$/, '') || '/')
+    if (!m) return null
+    if (m === 'method') return { status: 405, body: { error: `method ${req.method} not allowed here`, code: 'method_not_allowed' } }
     try {
-      const issuer = await tk.authenticate(req.authorization)
-      if (!issuer) throw unauthorized('send an issuer token: Authorization: Bearer <token>')
+      const who = await tk.authenticate(req.authorization)
+      if (!who) throw unauthorized('send a token: Authorization: Bearer <token>')
       const body = req.body === undefined || req.body === null ? {} : req.body
       if (typeof body !== 'object' || Array.isArray(body)) throw badRequest('the body must be a JSON object')
-      return { status: 200, body: await route(issuer, body as Record<string, unknown>) }
+      return await routes[m.key]!(who, body as Record<string, unknown>, m.ref, u.searchParams)
     } catch (err) {
       return errorResponse(err, log)
     }
   }
 }
 
-/** The contract's `permissions` for a Turnkey service: `{"grants": [...]}` and nothing else. */
-function permissionGrants(p: unknown): string[] {
-  if (!p || typeof p !== 'object' || Array.isArray(p) || !Array.isArray((p as { grants?: unknown }).grants)) {
-    throw badRequest('permissions must be {"grants": ["<action>:<resource>", ...]}')
+const CREATE_FIELDS = ['label', 'name', 'grants', 'expiresAt', 'ttlSeconds', 'subject', 'child', 'dryRun']
+
+function createInput(body: Record<string, unknown>): CreateTokenInput {
+  only(body, CREATE_FIELDS)
+  if (body.child !== undefined && typeof body.child !== 'boolean') throw badRequest('child must be true or false')
+  if (body.dryRun !== undefined && typeof body.dryRun !== 'boolean') throw badRequest('dryRun must be true or false')
+  ttlField(body)
+  for (const k of ['label', 'name', 'expiresAt'] as const) {
+    if (body[k] !== undefined && body[k] !== null && typeof body[k] !== 'string') throw badRequest(`${k} must be a string`)
   }
-  const extra = Object.keys(p).filter((k) => k !== 'grants')
-  if (extra.length) throw badRequest(`unknown permission fields: ${extra.join(', ')}`)
-  const grants = (p as { grants: unknown[] }).grants
-  if (grants.some((g) => typeof g !== 'string')) throw badRequest('each grant must be a string')
-  return grants as string[]
+  return {
+    grants: grantsOf(body),
+    ...(body.label != null ? { label: body.label as string } : {}),
+    ...(body.name != null ? { name: body.name as string } : {}),
+    ...(body.expiresAt != null ? { expiresAt: body.expiresAt as string } : {}),
+    ...(body.ttlSeconds != null ? { ttlSeconds: body.ttlSeconds as number } : {}),
+    ...(body.subject !== undefined ? { subject: body.subject as Record<string, unknown> | null } : {}),
+    child: body.child === true,
+  }
+}
+
+function ttlField(body: Record<string, unknown>): void {
+  if (body.ttlSeconds != null && typeof body.ttlSeconds !== 'number') throw badRequest('ttlSeconds must be a number')
+}
+
+function grantsOf(body: Record<string, unknown>): string[] {
+  const g = body.grants
+  if (!Array.isArray(g) || g.some((x) => typeof x !== 'string')) throw badRequest('grants must be a list of permissions, e.g. ["read:*"]')
+  return g as string[]
+}
+
+/** Unknown fields are refused, so a typo isn't silently ignored. */
+function only(body: Record<string, unknown>, allowed: string[]): void {
+  const extra = Object.keys(body).filter((k) => !allowed.includes(k))
+  if (extra.length) throw badRequest(`unknown field(s): ${extra.join(', ')}`)
 }
 
 /** Reads a JSON body from a Node stream, up to `limit` bytes. Empty → undefined. */

@@ -1,13 +1,14 @@
-export { createTurnkey, Turnkey, TokenApi, CredentialApi, SessionApi } from './turnkey.js'
+export { createTurnkey, Turnkey, TokenApi, SessionApi } from './turnkey.js'
 export type {
+  Actor,
   Principal,
   TokenInfo,
-  TokenKind,
   TurnkeyOptions,
   CreateTokenInput,
+  CreatePlan,
+  ExtendInput,
   ImportTokenInput,
-  IssueInput,
-  IssuedCredential,
+  ExportedToken,
   CreateSessionInput,
 } from './turnkey.js'
 export { TurnkeyError } from './errors.js'
@@ -15,6 +16,6 @@ export { parsePermission, formatPermission, covers, canonical, Actions, MANAGE, 
 export type { Permission, ActionRules } from './permissions.js'
 export { runAdminCli } from './admin.js'
 export type { AdminIo } from './admin.js'
-export { sessionCookie, clearSessionCookie, readCookie, authenticateRequest, credentialRoutes, errorResponse } from './http.js'
-export type { CookieOptions, AuthOptions, AuthResult, RequestCredentials, CredentialRoutesOptions, ContractRequest, JsonResponse } from './http.js'
+export { sessionCookie, clearSessionCookie, readCookie, authenticateRequest, turnkeyRoutes, errorResponse } from './http.js'
+export type { CookieOptions, AuthOptions, AuthResult, RequestCredentials, RoutesOptions, ApiRequest, JsonResponse } from './http.js'
 export { LATEST_VERSION as SCHEMA_VERSION } from './schema.js'
