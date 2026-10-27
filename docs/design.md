@@ -35,7 +35,11 @@ two optional properties, and that is all that distinguishes the uses:
 - There is **no cache**: `authenticate` reads the service's own database on every call, so a
   revoke applies on the next request.
 - `last_used_at` is written at most every five minutes per token, to answer "is this still used?"
-  without a write per request.
+  without a write per request. That write, and a session's slide, are best-effort: a token that was
+  valid when read is never refused because recording its use failed (two requests on one token can
+  race to write the same row, which Dolt rejects for one of them). The failure is logged, the next
+  request writes again, and a slide that was not written is not reported (`renewed` stays false).
+  Timestamps are whole seconds, so racing writers usually carry the same value and merge cleanly.
 
 **Why one concept (0.2.0).** 0.1 had a separate credential API (`issue`, `renew`, `revoke`) and
 its own HTTP contract beside the token operations, with different rules: an issuer was limited to

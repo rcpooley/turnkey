@@ -4,7 +4,7 @@ import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { createTurnkey } from '../dist/index.js'
-import { available, childOf, clock, fresh, PERMISSIONS, principalWith } from './helpers.mjs'
+import { available, backends, childOf, clock, fresh, PERMISSIONS, principalWith } from './helpers.mjs'
 
 const sha = (s) => createHash('sha256').update(s).digest('hex')
 // `re` is a pattern the message must match, or a note saying why.
@@ -206,6 +206,24 @@ for (const backend of await available()) {
         t.clock.advance(300)
         await t.tk.authenticate(secret)
         assert.equal((await t.tk.tokens.get('u', 'x')).lastUsedAt, t.clock.now().toISOString())
+      } finally {
+        await t.close()
+      }
+    })
+
+    test('concurrent requests on a stale token all succeed', async () => {
+      // Each clock reading is a second later, so racing writers carry different values: the case an
+      // optimistic-concurrency backend (Dolt) rejects for all but one of them.
+      let base = Date.parse('2030-01-01T00:00:00.000Z')
+      let tick = 0
+      const t = await fresh(backend, { now: () => new Date(base + tick++ * 1000) })
+      try {
+        const { secret } = await t.tk.tokens.create({ label: 'busy', grants: ['read:*'] }, 'x')
+        assert.ok(await t.tk.authenticate(secret))
+        base += 10 * 60_000
+        const all = await Promise.all(Array.from({ length: 8 }, () => t.tk.authenticate(secret)))
+        assert.equal(all.filter((p) => p?.label === 'busy').length, 8, 'every request got the principal')
+        assert.ok(Date.parse((await t.tk.tokens.get('busy', 'x')).lastUsedAt) >= base, 'one of them recorded the use')
       } finally {
         await t.close()
       }
@@ -720,3 +738,60 @@ for (const backend of await available()) {
     }
   })
 }
+
+// The bookkeeping write's failure path, forced: a driver whose UPDATE of the usage columns fails.
+describe('a failed usage write never fails authenticate', () => {
+  const sqlite = backends.find((b) => b.name === 'sqlite')
+  const failing = (fail) => ({
+    ...sqlite,
+    async open() {
+      const env = await sqlite.open()
+      const driver = {
+        ...env.driver,
+        async run(sql, params) {
+          if (fail.on && /^UPDATE .* SET .*last_used_at = \?/.test(sql)) throw new Error('serialization failure: this transaction conflicts with a committed transaction from another client')
+          return env.driver.run(sql, params)
+        },
+      }
+      return { ...env, driver }
+    },
+  })
+
+  test('the principal is returned, the failure is logged, and the next request writes', async () => {
+    const fail = { on: false }
+    const logged = []
+    const t = await fresh(failing(fail), { log: (m) => logged.push(m) })
+    try {
+      const { secret } = await t.tk.tokens.create({ label: 'u', grants: ['read:*'] }, 'x')
+      fail.on = true
+      const p = await t.tk.authenticate(secret)
+      assert.equal(p.label, 'u')
+      assert.equal((await t.tk.tokens.get('u', 'x')).lastUsedAt, null, 'nothing recorded')
+      assert.equal(logged.filter((m) => /could not record the use of token "u"/.test(m)).length, 1)
+      fail.on = false
+      assert.ok(await t.tk.authenticate(secret))
+      assert.equal((await t.tk.tokens.get('u', 'x')).lastUsedAt, t.clock.now().toISOString(), 'recorded on the next request')
+    } finally {
+      await t.close()
+    }
+  })
+
+  test('a slide that was not written is not reported: renewed is false and expiresAt unchanged', async () => {
+    const fail = { on: false }
+    const t = await fresh(failing(fail), { sessions: { ttlSeconds: 86_400 }, log: () => {} })
+    try {
+      const { token, secret } = await t.tk.sessions.create({ grants: ['read:*'] }, 'login')
+      t.clock.advance(3 * 3600)
+      fail.on = true
+      let p = await t.tk.authenticate(secret)
+      assert.equal(p.renewed, false)
+      assert.equal(p.expiresAt, token.expiresAt)
+      fail.on = false
+      p = await t.tk.authenticate(secret)
+      assert.equal(p.renewed, true)
+      assert.equal(p.expiresAt, new Date(t.clock.ms + 86_400_000).toISOString())
+    } finally {
+      await t.close()
+    }
+  })
+})
