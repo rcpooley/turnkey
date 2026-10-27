@@ -80,7 +80,7 @@ export interface TurnkeyOptions {
   }
   /** Commit author for the one Dolt commit Turnkey makes (adding its tables to `dolt_ignore`). */
   doltAuthor?: string
-  /** Startup messages. Default: none. */
+  /** Startup messages, and failures Turnkey survives (a purge or a usage write that failed). Default: none. */
   log?: (msg: string) => void
   /** The clock, for tests. */
   now?: () => Date
@@ -148,6 +148,9 @@ export interface CreateSessionInput {
 
 const LABEL_RE = /^[a-z0-9][a-z0-9._@-]{0,127}$/
 const LAST_USED_EVERY_MS = 5 * 60_000
+
+/** An ISO timestamp truncated to the second. */
+const wholeSeconds = (d: Date) => new Date(Math.floor(d.getTime() / 1000) * 1000).toISOString()
 const MAX_TTL = 100 * 365 * 86_400
 const DAY = 86_400
 const COLUMNS = [
@@ -232,28 +235,43 @@ export class Turnkey {
     const grants = row.parent ? this.childGrants(row) : splitGrants(row.grants)
 
     const now = this.clock()
-    const nowIso = now.toISOString()
     let expiresAt = nullable(row.expires_at)
     let renewed = false
     const slide = row.slide_seconds === null || row.slide_seconds === undefined ? null : Number(row.slide_seconds)
     const sets: string[] = []
     const params: unknown[] = []
+    let slidTo: string | null = null
     if (slide && expiresAt) {
       // Extend at most every slide/10 (capped at an hour), so a busy session isn't a write per request.
       const step = Math.min(3600, Math.floor(slide / 10)) * 1000
       const target = new Date(now.getTime() + slide * 1000)
       if (target.getTime() - Date.parse(expiresAt) >= step) {
-        expiresAt = target.toISOString()
-        renewed = true
+        slidTo = wholeSeconds(target)
         sets.push('expires_at = ?')
-        params.push(expiresAt)
+        params.push(slidTo)
       }
     }
     if (!row.last_used_at || now.getTime() - Date.parse(String(row.last_used_at)) >= LAST_USED_EVERY_MS || sets.length) {
       sets.push('last_used_at = ?')
-      params.push(nowIso)
+      params.push(wholeSeconds(now))
     }
-    if (sets.length) await this.db.run(`UPDATE ${this.table} SET ${sets.join(', ')} WHERE id = ? AND revoked_at IS NULL`, [...params, row.id])
+    if (sets.length) {
+      // Bookkeeping is best-effort: the token was valid when read, and a failed write must not turn
+      // that into an error. Concurrent requests on one token race to write the same cells, which an
+      // optimistic-concurrency backend (Dolt) rejects for one of them; the next request writes again.
+      // Timestamps are whole seconds so that racing writers usually carry the same value, which
+      // such backends merge without conflict.
+      try {
+        await this.db.run(`UPDATE ${this.table} SET ${sets.join(', ')} WHERE id = ? AND revoked_at IS NULL`, [...params, row.id])
+        if (slidTo) {
+          expiresAt = slidTo
+          renewed = true
+        }
+      } catch (err) {
+        // Report the stored expiry: a slide that was not written must not reach a cookie.
+        this.opts.log?.(`turnkey: could not record the use of token "${String(row.label)}": ${(err as Error)?.message ?? err}`)
+      }
+    }
     return {
       id: String(row.id),
       label: String(row.label),

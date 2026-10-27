@@ -1,6 +1,6 @@
 {
   "name": "@rcpooley/turnkey",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "API tokens with scoped permissions, child tokens for jobs and browser sessions, kept in a service's own database.",
   "license": "MIT",
   "type": "module",
